@@ -1,35 +1,66 @@
 """
-LOBELS BISCUITS — STORES AI ASSISTANT
-=====================================
-Netrisyl Insights
-Stack: Gradio + Supabase Postgres + GPT-4o-mini
+LOBELS BISCUITS - STORES AI ASSISTANT
+======================================
+Netrisyl Insights.
+Design replicated from JCC Assistant (navy + gold, Inter font, hero + sidebar cards).
+Stack: Gradio + Supabase Postgres + GPT-4o-mini.
 Pattern: GPT tool-calling returns query params, Python runs the SQL.
-Design: three-column layout, Lobels blue/red brand palette.
 """
 
 import os
 import json
-import datetime
+import base64
+from pathlib import Path
+from datetime import date
+
 import gradio as gr
 from supabase import create_client, Client
 from openai import OpenAI
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = OpenAI(api_key=OPENAI_KEY)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+SUPABASE_URL   = os.environ["SUPABASE_URL"]
+SUPABASE_KEY   = os.environ["SUPABASE_SERVICE_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+OPENAI_MODEL = "gpt-4o-mini"
+
+sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+oai = OpenAI(api_key=OPENAI_API_KEY)
 
 CLIENT_ID = "lobels"
 MONTH_ORDER = ["JAN","FEB","MAR","APR","MAY","JUN",
                "JUL","AUG","SEP","OCT","NOV","DEC"]
 
-LOBELS_BLUE = "#1B4DB1"
-LOBELS_RED  = "#E2231A"
-LOBELS_DARK = "#0F2E6E"
+
+# ---------------------------------------------------------------------------
+# Logos as base64
+# ---------------------------------------------------------------------------
+LOGO_PATH = Path(__file__).parent / "logo.png"
+if LOGO_PATH.exists():
+    with open(LOGO_PATH, "rb") as f:
+        LOGO_B64 = base64.b64encode(f.read()).decode("ascii")
+    LOGO_DATA_URI = f"data:image/png;base64,{LOGO_B64}"
+else:
+    LOGO_DATA_URI = ""
+
+NETRISYL_LOGO_PATH = Path(__file__).parent / "netrisyl_logo.png"
+if NETRISYL_LOGO_PATH.exists():
+    with open(NETRISYL_LOGO_PATH, "rb") as f:
+        NETRISYL_B64 = base64.b64encode(f.read()).decode("ascii")
+    NETRISYL_DATA_URI = f"data:image/png;base64,{NETRISYL_B64}"
+else:
+    NETRISYL_DATA_URI = ""
 
 
+# ---------------------------------------------------------------------------
+# Data access (Python runs the queries)
+# NOTE: in DATA EXPORT, monthly values (variance, opening, closing, total)
+# repeat on every daily row. daily_issues is genuinely per-day so SUM is right;
+# variance must take ONE value per material per month (not summed).
+# ---------------------------------------------------------------------------
 def _num(v):
     try:
         return float(v or 0)
@@ -38,7 +69,7 @@ def _num(v):
 
 
 def q_material_total(description=None, month=None):
-    qry = supabase.table("lobels_stores").select(
+    qry = sb.table("lobels_stores").select(
         "description, daily_issues, month").eq("client_id", CLIENT_ID)
     if description:
         qry = qry.ilike("description", f"%{description}%")
@@ -54,7 +85,7 @@ def q_material_total(description=None, month=None):
 
 
 def q_top_materials(month=None, limit=10):
-    qry = supabase.table("lobels_stores").select(
+    qry = sb.table("lobels_stores").select(
         "description, daily_issues, month").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
@@ -68,7 +99,7 @@ def q_top_materials(month=None, limit=10):
 
 
 def q_variances(month=None, flag="LOSS", limit=10):
-    qry = supabase.table("lobels_stores").select(
+    qry = sb.table("lobels_stores").select(
         "description, variance, month").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
@@ -88,7 +119,7 @@ def q_variances(month=None, flag="LOSS", limit=10):
 
 
 def q_category_breakdown(month=None):
-    qry = supabase.table("lobels_stores").select(
+    qry = sb.table("lobels_stores").select(
         "category, daily_issues, month").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
@@ -103,7 +134,7 @@ def q_category_breakdown(month=None):
 
 
 def q_monthly_trend(description):
-    rows = supabase.table("lobels_stores").select(
+    rows = sb.table("lobels_stores").select(
         "description, daily_issues, month").eq("client_id", CLIENT_ID
         ).ilike("description", f"%{description}%").execute().data
     if not rows:
@@ -116,6 +147,9 @@ def q_monthly_trend(description):
     return {"found": True, "material": rows[0]["description"], "trend": ordered}
 
 
+# ---------------------------------------------------------------------------
+# GPT tool definitions
+# ---------------------------------------------------------------------------
 TOOLS = [
     {"type": "function", "function": {
         "name": "q_material_total",
@@ -157,7 +191,7 @@ FUNC_MAP = {
     "q_monthly_trend": q_monthly_trend,
 }
 
-TODAY = datetime.date.today().strftime("%d %B %Y")
+TODAY = date.today().strftime("%d %B %Y")
 SYSTEM_PROMPT = f"""You are the Lobels Biscuits Stores AI Assistant, built by Netrisyl Insights.
 Today's date is {TODAY}.
 You answer questions about raw material stores data: consumption, variances, and trends.
@@ -175,15 +209,15 @@ Rules:
 """
 
 
-def chat_fn(message, history):
+def chat_answer(message, history):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in (history or []):
         if isinstance(h, dict) and h.get("role") in ("user", "assistant"):
             messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": message})
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini", messages=messages,
+    resp = oai.chat.completions.create(
+        model=OPENAI_MODEL, messages=messages,
         tools=TOOLS, tool_choice="auto", temperature=0)
     msg = resp.choices[0].message
 
@@ -199,92 +233,270 @@ def chat_fn(message, history):
                 result = {"error": str(e)}
             messages.append({"role": "tool", "tool_call_id": tc.id,
                              "content": json.dumps(result)})
-        final = client.chat.completions.create(
-            model="gpt-4o-mini", messages=messages, temperature=0)
+        final = oai.chat.completions.create(
+            model=OPENAI_MODEL, messages=messages, temperature=0)
         return final.choices[0].message.content
     return msg.content or "I couldn't find an answer to that."
 
 
-LOGO_EXISTS = os.path.exists("logo.png")
-
-QUICK_QUESTIONS = [
+SUGGESTED = [
     "Which materials had the highest losses?",
     "How much Flour National Foods did we use in January?",
     "Top 10 materials by consumption",
     "Compare sugar use across months",
+    "Which materials gained stock (surplus)?",
     "Break down consumption by category",
 ]
 
-CSS = f"""
-.gradio-container {{max-width: 1200px !important;}}
-#lobels-header {{
-    background: linear-gradient(135deg, {LOBELS_BLUE} 0%, {LOBELS_DARK} 100%);
-    border-radius: 14px; padding: 18px 24px; margin-bottom: 14px;
-    display: flex; align-items: center; gap: 18px;
-}}
-#lobels-header img {{height: 64px; width: auto;
-    background: #fff; border-radius: 10px; padding: 4px;}}
-#lobels-header .title {{color: #fff;}}
-#lobels-header .title h1 {{margin: 0; font-size: 22px; font-weight: 700;}}
-#lobels-header .title p {{margin: 2px 0 0; font-size: 13px; opacity: .85;}}
-.side-label {{color: {LOBELS_BLUE}; font-size: 12px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: 1px; margin: 8px 0 6px;}}
-#lobels-footer {{text-align: center; color: #888; font-size: 12px;
-    margin-top: 14px; padding-top: 10px; border-top: 1px solid #eee;}}
+
+# ---------------------------------------------------------------------------
+# UI  (replicated from JCC: navy + gold, Inter, hero + sidebar cards)
+# ---------------------------------------------------------------------------
+CUSTOM_CSS = """
+.gradio-container {
+    font-family: 'Inter', 'Helvetica Neue', system-ui, sans-serif !important;
+    max-width: 1400px !important;
+    margin: 0 auto !important;
+}
+#lobels-hero {
+    background: linear-gradient(135deg, #1B2A4E 0%, #2C4170 100%);
+    border-radius: 16px;
+    padding: 28px 32px;
+    margin-bottom: 18px;
+    color: white;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    box-shadow: 0 8px 24px rgba(27, 42, 78, 0.18);
+    position: relative;
+    overflow: hidden;
+}
+#lobels-hero::after {
+    content: "";
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 4px;
+    background: linear-gradient(90deg, #C9A55C 0%, #E4CC8E 50%, #C9A55C 100%);
+}
+#lobels-hero img.logo {
+    width: 88px;
+    height: 88px;
+    border-radius: 50%;
+    background: white;
+    padding: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    flex-shrink: 0;
+    object-fit: contain;
+}
+#lobels-hero .titles h1 {
+    font-size: 1.9em !important;
+    font-weight: 700 !important;
+    margin: 0 0 4px 0 !important;
+    color: white !important;
+    letter-spacing: -0.5px;
+}
+#lobels-hero .titles .brand-name {
+    font-size: 0.85em;
+    color: #C9A55C;
+    letter-spacing: 3px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+}
+#lobels-hero .titles .tagline {
+    font-size: 0.95em;
+    color: #cbd5e1;
+    margin: 0;
+}
+.sidebar-card {
+    background: white;
+    border-radius: 12px;
+    padding: 16px;
+    border: 1px solid #e5e7eb;
+    margin-bottom: 12px;
+}
+.sidebar-card h3 {
+    color: #1B2A4E;
+    font-size: 0.78em;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin: 0 0 12px 0;
+    font-weight: 700;
+    border-left: 3px solid #C9A55C;
+    padding-left: 10px;
+}
+.suggest-btn button {
+    background: white !important;
+    border: 1px solid #e5e7eb !important;
+    color: #1B2A4E !important;
+    text-align: left !important;
+    font-weight: 500 !important;
+    font-size: 0.88em !important;
+    padding: 10px 12px !important;
+    line-height: 1.35 !important;
+    white-space: normal !important;
+    height: auto !important;
+    min-height: 40px !important;
+    transition: all 0.15s ease;
+    width: 100% !important;
+    justify-content: flex-start !important;
+}
+.suggest-btn button:hover {
+    background: #1B2A4E !important;
+    color: white !important;
+    border-color: #1B2A4E !important;
+    transform: translateX(2px);
+}
+#info-panel {
+    background: #fefcf7;
+    border: 1px solid #e8dfc7;
+    border-radius: 12px;
+    padding: 18px 20px;
+    font-size: 0.92em;
+    line-height: 1.55;
+    color: #1f2937;
+}
+#info-panel h3 { color: #1B2A4E; margin-top: 0; }
+#netrisyl-footer {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 22px 12px 14px 12px;
+    margin-top: 8px;
+    border-top: 1px solid #e8e1cf;
+}
+#netrisyl-footer .prototype-note {
+    color: #9ca3af;
+    font-size: 0.8em;
+    text-align: center;
+    margin: 0;
+}
+#netrisyl-footer .powered-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+#netrisyl-footer .powered-row .label {
+    font-size: 0.85em;
+    color: #6b7280;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    font-weight: 600;
+}
+#netrisyl-footer .powered-row img {
+    height: 64px;
+    width: auto;
+    display: block;
+}
+footer { display: none !important; }
 """
 
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"),
-               css=CSS, title="Lobels Stores AI Assistant") as demo:
 
-    logo_tag = '<img src="/gradio_api/file=logo.png" alt="Lobels"/>' if LOGO_EXISTS else ""
+theme = gr.themes.Soft(
+    primary_hue=gr.themes.colors.slate,
+    secondary_hue=gr.themes.colors.amber,
+    neutral_hue=gr.themes.colors.slate,
+    font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
+).set(
+    button_primary_background_fill="#1B2A4E",
+    button_primary_background_fill_hover="#0F1A35",
+    button_primary_text_color="white",
+    body_background_fill="#F7F3EC",
+    block_background_fill="white",
+    block_border_color="#e5e7eb",
+)
+
+
+with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) as demo:
+
+    logo_img_html = (
+        f'<img class="logo" src="{LOGO_DATA_URI}" alt="Lobels Logo"/>'
+        if LOGO_DATA_URI else ""
+    )
     gr.HTML(f"""
-        <div id="lobels-header">
-          {logo_tag}
-          <div class="title">
-            <h1>Lobels Biscuits &mdash; Stores AI Assistant</h1>
-            <p>Powered by Netrisyl Insights &middot; Raw material data Jan&ndash;Jun 2026</p>
-          </div>
+    <div id="lobels-hero">
+        {logo_img_html}
+        <div class="titles">
+            <div class="brand-name">Lobels Biscuits &amp; Sweets</div>
+            <h1>Stores AI Assistant</h1>
+            <p class="tagline">Ask about raw material consumption, stock variances and trends for 2026.</p>
         </div>
+    </div>
     """)
 
     with gr.Row():
+        # LEFT SIDEBAR
         with gr.Column(scale=1, min_width=240):
-            gr.HTML('<div class="side-label">Suggested questions</div>')
-            q_buttons = [gr.Button(q, size="sm") for q in QUICK_QUESTIONS]
-            gr.HTML('<div class="side-label" style="margin-top:18px;">What I can do</div>')
-            gr.Markdown(
-                "- Material consumption (daily & monthly)\n"
-                "- Stock variances (losses & gains)\n"
-                "- Top materials & category breakdowns\n"
-                "- Month-by-month trends")
+            with gr.Group(elem_classes=["sidebar-card"]):
+                gr.HTML("<h3>Suggested Questions</h3>")
+                suggest_btns = [
+                    gr.Button(q, elem_classes=["suggest-btn"])
+                    for q in SUGGESTED
+                ]
 
-        with gr.Column(scale=3):
+        # MAIN CHAT
+        with gr.Column(scale=2):
             chatbot = gr.Chatbot(
-                height=480, type="messages",
-                avatar_images=(None, "logo.png") if LOGO_EXISTS else None,
-                show_copy_button=True)
-            with gr.Row():
-                msg = gr.Textbox(
-                    placeholder="Ask about materials, variances, trends...",
-                    show_label=False, scale=8)
-                send = gr.Button("Ask", variant="primary", scale=1)
+                type="messages",
+                height=560,
+                avatar_images=(None, str(LOGO_PATH) if LOGO_PATH.exists() else None),
+                show_label=False,
+                show_copy_button=True,
+            )
+            msg = gr.Textbox(
+                placeholder="Ask about materials, variances, trends...",
+                show_label=False,
+                container=False,
+                autofocus=True,
+            )
 
-    gr.HTML('<div id="lobels-footer">Netrisyl Insights &middot; netrisyl.com</div>')
+        # RIGHT INFO PANEL
+        with gr.Column(scale=2):
+            with gr.Group(elem_classes=["sidebar-card"]):
+                gr.HTML("<h3>About this assistant</h3>")
+                gr.Markdown(
+                    "**Data:** 88 raw materials, Jan–Jun 2026.\n\n"
+                    "**I can answer:**\n"
+                    "- Material consumption (daily & monthly)\n"
+                    "- Stock variances — losses & gains\n"
+                    "- Top materials & category breakdowns\n"
+                    "- Month-by-month trends\n\n"
+                    "All figures come directly from the stores register. "
+                    "I never invent numbers.",
+                    elem_id="info-panel",
+                )
 
-    def respond(message, chat_history):
+    # ---------- chat plumbing ----------
+    def respond(message, history):
         if not message or not message.strip():
-            return "", chat_history or []
-        chat_history = chat_history or []
-        reply = chat_fn(message, chat_history)
-        chat_history.append({"role": "user", "content": message})
-        chat_history.append({"role": "assistant", "content": reply})
-        return "", chat_history
+            return "", history or []
+        history = history or []
+        reply = chat_answer(message, history)
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": reply})
+        return "", history
 
     msg.submit(respond, [msg, chatbot], [msg, chatbot])
-    send.click(respond, [msg, chatbot], [msg, chatbot])
-    for btn, q in zip(q_buttons, QUICK_QUESTIONS):
+
+    for btn, q in zip(suggest_btns, SUGGESTED):
         btn.click(lambda x=q: x, outputs=msg).then(
             respond, [msg, chatbot], [msg, chatbot])
+
+    netrisyl_img_html = (
+        f'<img src="{NETRISYL_DATA_URI}" alt="Netrisyl Insights"/>'
+        if NETRISYL_DATA_URI else '<span class="label" style="color:#C9A55C;">Netrisyl Insights</span>'
+    )
+    gr.HTML(f"""
+    <div id="netrisyl-footer">
+        <p class="prototype-note">Lobels Stores Assistant &mdash; Prototype. The bot only answers from loaded stores data.</p>
+        <div class="powered-row">
+            <span class="label">Powered by</span>
+            {netrisyl_img_html}
+        </div>
+    </div>
+    """)
+
 
 if __name__ == "__main__":
     demo.launch()
