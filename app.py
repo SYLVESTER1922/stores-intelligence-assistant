@@ -119,6 +119,104 @@ def material_snapshot(material_name):
 
 
 # ---------------------------------------------------------------------------
+# Quick Reports — sidebar summary panels (one-click, no typing)
+# ---------------------------------------------------------------------------
+def _latest_month():
+    """Most recent month present in the data."""
+    rows = sb.table("lobels_stores").select("txn_date, month").eq(
+        "client_id", CLIENT_ID).order("txn_date", desc=True).limit(1).execute().data
+    return rows[0]["month"] if rows else "JUN"
+
+
+def report_reorder():
+    res = q_reorder_status()
+    items = [i for i in res["items"] if i["status"] == "REORDER NOW"]
+    if not items:
+        return "### 🔄 Reorder Alerts\n\nAll materials are above their reorder points. Nothing to order right now."
+    items = items[:12]
+    lines = [f"### 🔄 Reorder Alerts",
+             f"**{res['needing_reorder']} materials** are at or below reorder point.\n"]
+    for i in items:
+        lines.append(
+            f"**{i['material']}** — {_fmt(i['current_stock_kg'])} kg left "
+            f"(reorder at {_fmt(i['reorder_point_kg'])} kg)  \n"
+            f"   _{i.get('supplier') or 'n/a'} · {i.get('lead_time_days') or '?'} day lead_")
+    if res["needing_reorder"] > 12:
+        lines.append(f"\n…and {res['needing_reorder'] - 12} more.")
+    return "\n".join(lines)
+
+
+def report_losses():
+    month = _latest_month()
+    res = q_variances(month=month, flag="LOSS", limit=8)
+    items = [i for i in res["items"] if i["variance_kg"] < 0]
+    if not items:
+        return f"### 📉 Top Losses ({month} 2026)\n\nNo stock losses recorded this month."
+    lines = [f"### 📉 Top Losses ({month} 2026)\n"]
+    # Add USD value where we have a cost
+    mats = {m["description"]: _num(m.get("unit_cost_usd"))
+            for m in sb.table("lobels_materials").select(
+                "description, unit_cost_usd").execute().data}
+    for i in items:
+        cost = mats.get(i["material"], 0)
+        usd = abs(i["variance_kg"]) * cost
+        usd_str = f" ≈ **${_fmt(usd)}**" if cost else ""
+        lines.append(f"**{i['material']}** — {_fmt(i['variance_kg'])} kg{usd_str}")
+    return "\n\n".join(lines)
+
+
+def report_spend():
+    month = _latest_month()
+    # Spend = sum of (month issues x unit cost) across materials
+    mats = sb.table("lobels_materials").select(
+        "description, unit_cost_usd").execute().data
+    cost_map = {m["description"]: _num(m.get("unit_cost_usd")) for m in mats}
+    rows = sb.table("lobels_stores").select(
+        "description, daily_issues").eq("client_id", CLIENT_ID
+        ).eq("month", month).execute().data
+    spend = {}
+    for r in rows:
+        d = r["description"]
+        spend[d] = spend.get(d, 0) + _num(r["daily_issues"]) * cost_map.get(d, 0)
+    total = sum(spend.values())
+    top = sorted(spend.items(), key=lambda x: -x[1])[:8]
+    lines = [f"### 💵 Monthly Spend ({month} 2026)",
+             f"**Total consumption value: ${_fmt(total)}**\n",
+             "Top materials by value:"]
+    for name, val in top:
+        if val <= 0:
+            continue
+        lines.append(f"**{name}** — ${_fmt(val)}")
+    return "\n\n".join(lines)
+
+
+def report_runout():
+    """Materials that will run out before their lead time."""
+    mats = sb.table("lobels_materials").select("*").execute().data
+    risks = []
+    for m in mats:
+        name = m["description"]
+        lead = _num(m.get("lead_time_days"))
+        if lead <= 0:
+            continue
+        f = q_runout_forecast(name)
+        dleft = f.get("estimated_days_left")
+        if dleft is not None and dleft <= lead:
+            risks.append((name, dleft, lead, m.get("supplier")))
+    if not risks:
+        return "### ⏳ Run-out Risks\n\nNo materials are at immediate run-out risk."
+    risks.sort(key=lambda x: x[1])
+    lines = [f"### ⏳ Run-out Risks",
+             f"**{len(risks)} materials** will run out before new stock arrives.\n"]
+    for name, dleft, lead, sup in risks[:12]:
+        lines.append(f"**{name}** — ~{dleft} days left, {int(lead)} day lead  \n"
+                     f"   _order from {sup or 'n/a'} now_")
+    if len(risks) > 12:
+        lines.append(f"\n…and {len(risks) - 12} more.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Voice input (Whisper transcription)
 # ---------------------------------------------------------------------------
 def transcribe(audio_path):
@@ -652,6 +750,16 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
                 finder_out = gr.Markdown("", elem_id="finder-result")
 
             with gr.Group(elem_classes=["sidebar-card"]):
+                gr.HTML("<h3>Quick Reports</h3>")
+                with gr.Row():
+                    btn_reorder = gr.Button("🔄 Reorder Alerts", size="sm")
+                    btn_losses  = gr.Button("📉 Top Losses", size="sm")
+                with gr.Row():
+                    btn_spend   = gr.Button("💵 Monthly Spend", size="sm")
+                    btn_runout  = gr.Button("⏳ Run-out Risks", size="sm")
+                report_out = gr.Markdown("", elem_id="finder-result")
+
+            with gr.Group(elem_classes=["sidebar-card"]):
                 gr.HTML("<h3>Suggested Questions</h3>")
                 suggest_btns = [
                     gr.Button(q, elem_classes=["suggest-btn"]) for q in SUGGESTED
@@ -698,6 +806,12 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
     # material finder
     finder_btn.click(material_snapshot, inputs=material_dd, outputs=finder_out)
     material_dd.change(material_snapshot, inputs=material_dd, outputs=finder_out)
+
+    # quick reports
+    btn_reorder.click(report_reorder, outputs=report_out)
+    btn_losses.click(report_losses, outputs=report_out)
+    btn_spend.click(report_spend, outputs=report_out)
+    btn_runout.click(report_runout, outputs=report_out)
 
     # suggested questions
     for btn, q in zip(suggest_btns, SUGGESTED):
