@@ -749,22 +749,6 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
                 finder_btn = gr.Button("Get latest snapshot", variant="primary", size="sm")
                 finder_out = gr.Markdown("", elem_id="finder-result")
 
-            with gr.Group(elem_classes=["sidebar-card"]):
-                gr.HTML("<h3>Quick Reports</h3>")
-                with gr.Row():
-                    btn_reorder = gr.Button("🔄 Reorder Alerts", size="sm")
-                    btn_losses  = gr.Button("📉 Top Losses", size="sm")
-                with gr.Row():
-                    btn_spend   = gr.Button("💵 Monthly Spend", size="sm")
-                    btn_runout  = gr.Button("⏳ Run-out Risks", size="sm")
-                report_out = gr.Markdown("", elem_id="finder-result")
-
-            with gr.Group(elem_classes=["sidebar-card"]):
-                gr.HTML("<h3>Suggested Questions</h3>")
-                suggest_btns = [
-                    gr.Button(q, elem_classes=["suggest-btn"]) for q in SUGGESTED
-                ]
-
         # MAIN CHAT - wider (scale 3)
         with gr.Column(scale=3):
             chatbot = gr.Chatbot(
@@ -782,6 +766,24 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
                 send = gr.Button("Ask", variant="primary", scale=1, min_width=80)
             mic = gr.Audio(sources=["microphone"], type="filepath",
                            label="Or speak your question", show_label=True)
+
+        # RIGHT SIDEBAR - Quick Reports + Suggested Questions
+        with gr.Column(scale=1, min_width=260):
+            with gr.Group(elem_classes=["sidebar-card"]):
+                gr.HTML("<h3>Quick Reports</h3>")
+                with gr.Row():
+                    btn_reorder = gr.Button("🔄 Reorder Alerts", size="sm")
+                    btn_losses  = gr.Button("📉 Top Losses", size="sm")
+                with gr.Row():
+                    btn_spend   = gr.Button("💵 Monthly Spend", size="sm")
+                    btn_runout  = gr.Button("⏳ Run-out Risks", size="sm")
+                report_out = gr.Markdown("", elem_id="finder-result")
+
+            with gr.Group(elem_classes=["sidebar-card"]):
+                gr.HTML("<h3>Suggested Questions</h3>")
+                suggest_btns = [
+                    gr.Button(q, elem_classes=["suggest-btn"]) for q in SUGGESTED
+                ]
 
     gr.HTML('<div id="netrisyl-footer">Lobels Stores Assistant — Prototype · '
             'Answers only from loaded stores data · Powered by Netrisyl Insights</div>')
