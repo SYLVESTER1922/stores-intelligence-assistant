@@ -90,13 +90,9 @@ def material_snapshot(material_name):
     if not rows:
         return f"No data found for **{material_name}**."
 
-    # Find the latest day (max txn_date)
-    def _parse(d):
-        try:
-            return datetime.strptime(d, "%d-%b-%Y")
-        except Exception:
-            return datetime.min
-    rows.sort(key=lambda r: _parse(r.get("txn_date", "")), reverse=True)
+    # Find the latest day. Dates are ISO (YYYY-MM-DD) so plain string
+    # sorting is already chronological - no parsing needed.
+    rows.sort(key=lambda r: str(r.get("txn_date", "")), reverse=True)
     latest = rows[0]
 
     # Month totals for context
