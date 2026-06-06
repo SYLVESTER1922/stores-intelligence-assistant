@@ -215,6 +215,120 @@ def q_monthly_trend(description):
     return {"found": True, "material": rows[0]["description"], "trend": ordered}
 
 
+# ---- Reference-data tools (use lobels_materials) ----------------
+
+def _latest_closing(description):
+    """Most recent physical closing stock for a material."""
+    rows = sb.table("lobels_stores").select(
+        "physical_closing, txn_date").eq("client_id", CLIENT_ID
+        ).ilike("description", f"%{description}%").execute().data
+    if not rows:
+        return None
+    rows.sort(key=lambda r: str(r.get("txn_date", "")), reverse=True)
+    return _num(rows[0]["physical_closing"])
+
+
+def q_reorder_status(description=None):
+    """Materials at or below reorder point. If description given, just that one."""
+    mats = sb.table("lobels_materials").select("*").execute().data
+    if description:
+        mats = [m for m in mats if description.lower() in (m.get("description") or "").lower()]
+    out = []
+    for m in mats:
+        rop = _num(m.get("reorder_point"))
+        if rop <= 0:
+            continue
+        closing = _latest_closing(m["description"])
+        if closing is None:
+            continue
+        out.append({
+            "material": m["description"],
+            "current_stock_kg": round(closing, 1),
+            "reorder_point_kg": round(rop, 1),
+            "status": "REORDER NOW" if closing <= rop else "OK",
+            "supplier": m.get("supplier"),
+            "lead_time_days": m.get("lead_time_days"),
+        })
+    # Sort so REORDER NOW items come first
+    out.sort(key=lambda x: (x["status"] != "REORDER NOW", x["material"]))
+    needing = [o for o in out if o["status"] == "REORDER NOW"]
+    return {"checked": len(out), "needing_reorder": len(needing),
+            "items": out if description else (needing or out[:10])}
+
+
+def q_material_cost(description, month=None):
+    """Value of a material's consumption in USD (issues x unit cost)."""
+    mat = sb.table("lobels_materials").select("*").ilike(
+        "description", f"%{description}%").execute().data
+    if not mat:
+        return {"found": False, "searched_for": description}
+    m = mat[0]
+    cost = _num(m.get("unit_cost_usd"))
+    total = q_material_total(description=description, month=month)
+    if not total.get("found"):
+        return {"found": False, "searched_for": description}
+    kg = total["total_issues_kg"]
+    return {"found": True, "material": m["description"],
+            "unit_cost_usd": round(cost, 2),
+            "kg_used": kg,
+            "total_value_usd": round(kg * cost, 2),
+            "period": total["period"]}
+
+
+def q_supplier_lookup(description=None, supplier=None):
+    """Find the supplier of a material, or all materials from a supplier."""
+    mats = sb.table("lobels_materials").select(
+        "description, supplier, category, lead_time_days").execute().data
+    if supplier:
+        hits = [m for m in mats if supplier.lower() in (m.get("supplier") or "").lower()]
+        return {"supplier": supplier,
+                "materials": [{"material": h["description"],
+                               "category": h.get("category"),
+                               "lead_time_days": h.get("lead_time_days")} for h in hits]}
+    if description:
+        hits = [m for m in mats if description.lower() in (m.get("description") or "").lower()]
+        if not hits:
+            return {"found": False, "searched_for": description}
+        h = hits[0]
+        return {"found": True, "material": h["description"],
+                "supplier": h.get("supplier"),
+                "lead_time_days": h.get("lead_time_days")}
+    return {"error": "Provide a material or a supplier name."}
+
+
+def q_runout_forecast(description):
+    """Estimate days until stock runs out, vs lead time."""
+    mat = sb.table("lobels_materials").select("*").ilike(
+        "description", f"%{description}%").execute().data
+    if not mat:
+        return {"found": False, "searched_for": description}
+    m = mat[0]
+    name = m["description"]
+    closing = _latest_closing(name)
+    if closing is None:
+        return {"found": False, "searched_for": description}
+    # Average daily usage across the days it was actually issued
+    rows = sb.table("lobels_stores").select(
+        "daily_issues, txn_date").eq("client_id", CLIENT_ID
+        ).ilike("description", f"%{name}%").execute().data
+    issues = [_num(r["daily_issues"]) for r in rows if _num(r["daily_issues"]) > 0]
+    if not issues:
+        return {"found": True, "material": name, "note": "No usage recorded yet."}
+    avg_daily = sum(issues) / len(issues)
+    days_left = round(closing / avg_daily, 1) if avg_daily > 0 else None
+    lead = m.get("lead_time_days")
+    alert = None
+    if days_left is not None and lead is not None:
+        alert = ("ORDER NOW — stock runs out before new delivery arrives"
+                 if days_left <= _num(lead) else
+                 "OK — enough stock to cover the lead time")
+    return {"found": True, "material": name,
+            "current_stock_kg": round(closing, 1),
+            "avg_daily_use_kg": round(avg_daily, 1),
+            "estimated_days_left": days_left,
+            "lead_time_days": lead, "alert": alert}
+
+
 TOOLS = [
     {"type": "function", "function": {
         "name": "q_material_total",
@@ -245,6 +359,30 @@ TOOLS = [
         "description": "Month-by-month consumption trend for one material.",
         "parameters": {"type": "object", "properties": {
             "description": {"type": "string"}}, "required": ["description"]}}},
+    {"type": "function", "function": {
+        "name": "q_reorder_status",
+        "description": "Check which materials are at or below their reorder point and need reordering. Omit description to list all materials needing reorder; pass a material name to check just one.",
+        "parameters": {"type": "object", "properties": {
+            "description": {"type": "string", "description": "Optional material name to check one item."}}}}},
+    {"type": "function", "function": {
+        "name": "q_material_cost",
+        "description": "Value in USD of a material's consumption (kg used x unit cost). Use for spend questions like 'what did we spend on flour'.",
+        "parameters": {"type": "object", "properties": {
+            "description": {"type": "string", "description": "Distinctive part of material name."},
+            "month": {"type": "string", "description": "Three-letter month e.g. JAN. Omit for full year."}
+        }, "required": ["description"]}}},
+    {"type": "function", "function": {
+        "name": "q_supplier_lookup",
+        "description": "Find which supplier provides a material, OR list all materials from a given supplier.",
+        "parameters": {"type": "object", "properties": {
+            "description": {"type": "string", "description": "Material name (to find its supplier)."},
+            "supplier": {"type": "string", "description": "Supplier name (to list their materials)."}}}}},
+    {"type": "function", "function": {
+        "name": "q_runout_forecast",
+        "description": "Estimate how many days until a material runs out based on average usage, and whether to order now given its lead time.",
+        "parameters": {"type": "object", "properties": {
+            "description": {"type": "string", "description": "Distinctive part of material name."}
+        }, "required": ["description"]}}},
 ]
 
 FUNC_MAP = {
@@ -253,19 +391,25 @@ FUNC_MAP = {
     "q_variances": q_variances,
     "q_category_breakdown": q_category_breakdown,
     "q_monthly_trend": q_monthly_trend,
+    "q_reorder_status": q_reorder_status,
+    "q_material_cost": q_material_cost,
+    "q_supplier_lookup": q_supplier_lookup,
+    "q_runout_forecast": q_runout_forecast,
 }
 
 TODAY = date.today().strftime("%d %B %Y")
 SYSTEM_PROMPT = f"""You are the Lobels Biscuits Stores AI Assistant, built by Netrisyl Insights.
 Today's date is {TODAY}.
-You answer questions about raw material stores data: consumption, variances, and trends.
+You answer questions about raw material stores data: consumption, variances, trends,
+reorder status, costs/spend (in USD), suppliers, and run-out forecasts.
 You have data for January to June 2026 across 88 raw materials.
 
 Rules:
 - ALWAYS use a tool to fetch real figures. NEVER invent numbers.
 - When searching for a material, pass a SHORT distinctive fragment of its name
   (e.g. 'National Foods', 'Sugar', 'Palm Oil') so partial matching works.
-- Quote figures exactly as returned by the tools, in kilograms (kg).
+- Quote figures exactly as returned by the tools. Quantities in kilograms (kg), money in USD ($).
+- For reorder, cost, supplier, or run-out questions, use the matching tool.
 - Be concise and professional, in plain language a stores manager understands.
 - If a question is outside stores data, politely say it's out of scope.
 - Months available: JAN, FEB, MAR, APR, MAY, JUN (2026).
@@ -304,11 +448,12 @@ def chat_answer(message, history):
 
 
 SUGGESTED = [
+    "Which materials need reordering?",
+    "What did we spend on Flour National Foods in March?",
+    "Who supplies our sugar?",
+    "When will we run out of Palm Oil?",
     "Which materials had the highest losses?",
-    "How much Flour National Foods did we use in January?",
     "Top 10 materials by consumption",
-    "Compare sugar use across months",
-    "Break down consumption by category",
 ]
 
 
