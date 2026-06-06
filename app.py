@@ -2,16 +2,15 @@
 LOBELS BISCUITS - STORES AI ASSISTANT
 ======================================
 Netrisyl Insights.
-Design replicated from JCC Assistant (navy + gold, Inter font, hero + sidebar cards).
-Stack: Gradio + Supabase Postgres + GPT-4o-mini.
-Pattern: GPT tool-calling returns query params, Python runs the SQL.
+Design replicated from JCC Assistant (navy + gold, Inter font).
+Stack: Gradio + Supabase Postgres + GPT-4o-mini + Whisper (voice input).
 """
 
 import os
 import json
 import base64
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 
 import gradio as gr
 from supabase import create_client, Client
@@ -38,28 +37,20 @@ MONTH_ORDER = ["JAN","FEB","MAR","APR","MAY","JUN",
 # ---------------------------------------------------------------------------
 # Logos as base64
 # ---------------------------------------------------------------------------
-LOGO_PATH = Path(__file__).parent / "logo.png"
-if LOGO_PATH.exists():
-    with open(LOGO_PATH, "rb") as f:
-        LOGO_B64 = base64.b64encode(f.read()).decode("ascii")
-    LOGO_DATA_URI = f"data:image/png;base64,{LOGO_B64}"
-else:
-    LOGO_DATA_URI = ""
+def _data_uri(path, mime):
+    p = Path(__file__).parent / path
+    if p.exists():
+        with open(p, "rb") as f:
+            return f"data:{mime};base64," + base64.b64encode(f.read()).decode("ascii")
+    return ""
 
-NETRISYL_LOGO_PATH = Path(__file__).parent / "netrisyl_logo.png"
-if NETRISYL_LOGO_PATH.exists():
-    with open(NETRISYL_LOGO_PATH, "rb") as f:
-        NETRISYL_B64 = base64.b64encode(f.read()).decode("ascii")
-    NETRISYL_DATA_URI = f"data:image/png;base64,{NETRISYL_B64}"
-else:
-    NETRISYL_DATA_URI = ""
+LOGO_DATA_URI     = _data_uri("logo.png", "image/png")
+NETRISYL_DATA_URI = _data_uri("netrisyl_logo.png", "image/png")
+LOGO_PATH = Path(__file__).parent / "logo.png"
 
 
 # ---------------------------------------------------------------------------
-# Data access (Python runs the queries)
-# NOTE: in DATA EXPORT, monthly values (variance, opening, closing, total)
-# repeat on every daily row. daily_issues is genuinely per-day so SUM is right;
-# variance must take ONE value per material per month (not summed).
+# Helpers
 # ---------------------------------------------------------------------------
 def _num(v):
     try:
@@ -68,6 +59,87 @@ def _num(v):
         return 0.0
 
 
+def _fmt(n):
+    return f"{n:,.2f}".rstrip("0").rstrip(".") if n else "0"
+
+
+# ---------------------------------------------------------------------------
+# Material list for the finder dropdown
+# ---------------------------------------------------------------------------
+def load_material_names():
+    rows = sb.table("lobels_stores").select("description").eq(
+        "client_id", CLIENT_ID).execute().data
+    names = sorted({r["description"] for r in rows if r.get("description")})
+    return names
+
+try:
+    MATERIAL_NAMES = load_material_names()
+except Exception as e:
+    print("Could not load material names:", e)
+    MATERIAL_NAMES = []
+
+
+# ---------------------------------------------------------------------------
+# Material Finder - latest day snapshot for one material
+# ---------------------------------------------------------------------------
+def material_snapshot(material_name):
+    if not material_name:
+        return "Select a material above to see its latest snapshot."
+    rows = sb.table("lobels_stores").select("*").eq(
+        "client_id", CLIENT_ID).eq("description", material_name).execute().data
+    if not rows:
+        return f"No data found for **{material_name}**."
+
+    # Find the latest day (max txn_date)
+    def _parse(d):
+        try:
+            return datetime.strptime(d, "%d-%b-%Y")
+        except Exception:
+            return datetime.min
+    rows.sort(key=lambda r: _parse(r.get("txn_date", "")), reverse=True)
+    latest = rows[0]
+
+    # Month totals for context
+    month = latest.get("month")
+    month_rows = [r for r in rows if r.get("month") == month]
+    month_issues = sum(_num(r["daily_issues"]) for r in month_rows)
+
+    code = latest.get("stock_code", "")
+    cat  = latest.get("category", "")
+    dt   = latest.get("txn_date", "")
+    return f"""### {material_name}
+**Code:** {code}  ·  **Category:** {cat}
+
+**Latest day on record — {dt}**
+- Daily issues: **{_fmt(_num(latest.get('daily_issues')))} kg**
+- Receipts: **{_fmt(_num(latest.get('receipts')))} kg**
+- Opening stock: **{_fmt(_num(latest.get('opening_stock')))} kg**
+- Physical closing: **{_fmt(_num(latest.get('physical_closing')))} kg**
+
+**{month} 2026 summary**
+- Total issued this month: **{_fmt(month_issues)} kg**
+- Month variance: **{_fmt(_num(latest.get('variance')))} kg** ({latest.get('variance_flag','')})
+"""
+
+
+# ---------------------------------------------------------------------------
+# Voice input (Whisper transcription)
+# ---------------------------------------------------------------------------
+def transcribe(audio_path):
+    if not audio_path:
+        return ""
+    try:
+        with open(audio_path, "rb") as f:
+            tr = oai.audio.transcriptions.create(model="whisper-1", file=f)
+        return tr.text
+    except Exception as e:
+        print("Transcription failed:", e)
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Data access for the chatbot (GPT tool-calling)
+# ---------------------------------------------------------------------------
 def q_material_total(description=None, month=None):
     qry = sb.table("lobels_stores").select(
         "description, daily_issues, month").eq("client_id", CLIENT_ID)
@@ -147,15 +219,12 @@ def q_monthly_trend(description):
     return {"found": True, "material": rows[0]["description"], "trend": ordered}
 
 
-# ---------------------------------------------------------------------------
-# GPT tool definitions
-# ---------------------------------------------------------------------------
 TOOLS = [
     {"type": "function", "function": {
         "name": "q_material_total",
-        "description": "Total kg issued for a specific raw material, optionally for one month. Use a SHORT distinctive part of the name e.g. 'National Foods', 'Sugar', 'Palm Oil', 'Hex Flour' - the search matches partially.",
+        "description": "Total kg issued for a specific raw material, optionally for one month. Use a SHORT distinctive part of the name e.g. 'National Foods', 'Sugar', 'Palm Oil', 'Hex Flour'.",
         "parameters": {"type": "object", "properties": {
-            "description": {"type": "string", "description": "Distinctive part of material name. Prefer short fragments e.g. 'National Foods' not 'Flour National Foods Industrial'."},
+            "description": {"type": "string", "description": "Distinctive part of material name."},
             "month": {"type": "string", "description": "Three-letter month e.g. JAN. Omit for full year."}
         }, "required": ["description"]}}},
     {"type": "function", "function": {
@@ -179,8 +248,7 @@ TOOLS = [
         "name": "q_monthly_trend",
         "description": "Month-by-month consumption trend for one material.",
         "parameters": {"type": "object", "properties": {
-            "description": {"type": "string", "description": "Distinctive part of material name."}
-        }, "required": ["description"]}}},
+            "description": {"type": "string"}}, "required": ["description"]}}},
 ]
 
 FUNC_MAP = {
@@ -203,9 +271,9 @@ Rules:
   (e.g. 'National Foods', 'Sugar', 'Palm Oil') so partial matching works.
 - Quote figures exactly as returned by the tools, in kilograms (kg).
 - Be concise and professional, in plain language a stores manager understands.
-- If a question is outside stores data (HR, finance, etc.), politely say it's out of scope.
+- If a question is outside stores data, politely say it's out of scope.
 - Months available: JAN, FEB, MAR, APR, MAY, JUN (2026).
-- If no data is found for a material, say so clearly and suggest checking the name.
+- If no data is found for a material, say so clearly.
 """
 
 
@@ -244,28 +312,28 @@ SUGGESTED = [
     "How much Flour National Foods did we use in January?",
     "Top 10 materials by consumption",
     "Compare sugar use across months",
-    "Which materials gained stock (surplus)?",
     "Break down consumption by category",
 ]
 
 
 # ---------------------------------------------------------------------------
-# UI  (replicated from JCC: navy + gold, Inter, hero + sidebar cards)
+# UI  (JCC design - navy + gold, Inter)
 # ---------------------------------------------------------------------------
 CUSTOM_CSS = """
 .gradio-container {
     font-family: 'Inter', 'Helvetica Neue', system-ui, sans-serif !important;
-    max-width: 1400px !important;
+    max-width: 1500px !important;
     margin: 0 auto !important;
 }
 #lobels-hero {
     background: linear-gradient(135deg, #1B2A4E 0%, #2C4170 100%);
     border-radius: 16px;
-    padding: 28px 32px;
+    padding: 24px 32px;
     margin-bottom: 18px;
     color: white;
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 24px;
     box-shadow: 0 8px 24px rgba(27, 42, 78, 0.18);
     position: relative;
@@ -278,9 +346,9 @@ CUSTOM_CSS = """
     height: 4px;
     background: linear-gradient(90deg, #C9A55C 0%, #E4CC8E 50%, #C9A55C 100%);
 }
+#lobels-hero .hero-left { display: flex; align-items: center; gap: 24px; }
 #lobels-hero img.logo {
-    width: 88px;
-    height: 88px;
+    width: 84px; height: 84px;
     border-radius: 50%;
     background: white;
     padding: 6px;
@@ -289,14 +357,14 @@ CUSTOM_CSS = """
     object-fit: contain;
 }
 #lobels-hero .titles h1 {
-    font-size: 1.9em !important;
+    font-size: 1.8em !important;
     font-weight: 700 !important;
     margin: 0 0 4px 0 !important;
     color: white !important;
     letter-spacing: -0.5px;
 }
 #lobels-hero .titles .brand-name {
-    font-size: 0.85em;
+    font-size: 0.82em;
     color: #C9A55C;
     letter-spacing: 3px;
     font-weight: 600;
@@ -304,10 +372,30 @@ CUSTOM_CSS = """
     text-transform: uppercase;
 }
 #lobels-hero .titles .tagline {
-    font-size: 0.95em;
+    font-size: 0.92em;
     color: #cbd5e1;
     margin: 0;
 }
+#lobels-hero .powered {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    flex-shrink: 0;
+}
+#lobels-hero .powered .label {
+    font-size: 0.7em;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: #C9A55C;
+    font-weight: 600;
+}
+#lobels-hero .powered .ni {
+    font-size: 1.1em;
+    font-weight: 700;
+    color: white;
+}
+#lobels-hero .powered img { height: 48px; width: auto; }
 .sidebar-card {
     background: white;
     border-radius: 12px;
@@ -347,51 +435,27 @@ CUSTOM_CSS = """
     border-color: #1B2A4E !important;
     transform: translateX(2px);
 }
-#info-panel {
+#finder-result {
     background: #fefcf7;
     border: 1px solid #e8dfc7;
     border-radius: 12px;
-    padding: 18px 20px;
-    font-size: 0.92em;
-    line-height: 1.55;
+    padding: 16px 18px;
+    font-size: 0.9em;
+    line-height: 1.5;
     color: #1f2937;
+    margin-top: 10px;
 }
-#info-panel h3 { color: #1B2A4E; margin-top: 0; }
+#finder-result h3 { color: #1B2A4E; margin-top: 0; }
 #netrisyl-footer {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 6px;
-    padding: 22px 12px 14px 12px;
+    text-align: center;
+    color: #9ca3af;
+    font-size: 0.8em;
+    padding: 20px 12px 12px;
     margin-top: 8px;
     border-top: 1px solid #e8e1cf;
 }
-#netrisyl-footer .prototype-note {
-    color: #9ca3af;
-    font-size: 0.8em;
-    text-align: center;
-    margin: 0;
-}
-#netrisyl-footer .powered-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-#netrisyl-footer .powered-row .label {
-    font-size: 0.85em;
-    color: #6b7280;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    font-weight: 600;
-}
-#netrisyl-footer .powered-row img {
-    height: 64px;
-    width: auto;
-    display: block;
-}
 footer { display: none !important; }
 """
-
 
 theme = gr.themes.Soft(
     primary_hue=gr.themes.colors.slate,
@@ -410,33 +474,50 @@ theme = gr.themes.Soft(
 
 with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) as demo:
 
-    logo_img_html = (
-        f'<img class="logo" src="{LOGO_DATA_URI}" alt="Lobels Logo"/>'
-        if LOGO_DATA_URI else ""
-    )
+    logo_img_html = (f'<img class="logo" src="{LOGO_DATA_URI}" alt="Lobels"/>'
+                     if LOGO_DATA_URI else "")
+    powered_html = (f'<img src="{NETRISYL_DATA_URI}" alt="Netrisyl"/>'
+                    if NETRISYL_DATA_URI else '<div class="ni">Netrisyl Insights</div>')
     gr.HTML(f"""
     <div id="lobels-hero">
-        {logo_img_html}
-        <div class="titles">
-            <div class="brand-name">Lobels Biscuits &amp; Sweets</div>
-            <h1>Stores AI Assistant</h1>
-            <p class="tagline">Ask about raw material consumption, stock variances and trends for 2026.</p>
+        <div class="hero-left">
+            {logo_img_html}
+            <div class="titles">
+                <div class="brand-name">Lobels Biscuits &amp; Sweets</div>
+                <h1>Stores AI Assistant</h1>
+                <p class="tagline">Raw material consumption, stock variances and trends &middot; 2026</p>
+            </div>
+        </div>
+        <div class="powered">
+            <span class="label">Powered by</span>
+            {powered_html}
         </div>
     </div>
     """)
 
     with gr.Row():
-        # LEFT SIDEBAR
-        with gr.Column(scale=1, min_width=240):
+        # LEFT SIDEBAR - Material Finder + Suggested Questions
+        with gr.Column(scale=1, min_width=260):
+            with gr.Group(elem_classes=["sidebar-card"]):
+                gr.HTML("<h3>Raw Material Finder</h3>")
+                material_dd = gr.Dropdown(
+                    choices=MATERIAL_NAMES,
+                    label="Select a material",
+                    show_label=False,
+                    container=False,
+                    filterable=True,
+                )
+                finder_btn = gr.Button("Get latest snapshot", variant="primary", size="sm")
+                finder_out = gr.Markdown("", elem_id="finder-result")
+
             with gr.Group(elem_classes=["sidebar-card"]):
                 gr.HTML("<h3>Suggested Questions</h3>")
                 suggest_btns = [
-                    gr.Button(q, elem_classes=["suggest-btn"])
-                    for q in SUGGESTED
+                    gr.Button(q, elem_classes=["suggest-btn"]) for q in SUGGESTED
                 ]
 
-        # MAIN CHAT
-        with gr.Column(scale=2):
+        # MAIN CHAT - wider (scale 3)
+        with gr.Column(scale=3):
             chatbot = gr.Chatbot(
                 type="messages",
                 height=560,
@@ -444,30 +525,19 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
                 show_label=False,
                 show_copy_button=True,
             )
-            msg = gr.Textbox(
-                placeholder="Ask about materials, variances, trends...",
-                show_label=False,
-                container=False,
-                autofocus=True,
-            )
-
-        # RIGHT INFO PANEL
-        with gr.Column(scale=2):
-            with gr.Group(elem_classes=["sidebar-card"]):
-                gr.HTML("<h3>About this assistant</h3>")
-                gr.Markdown(
-                    "**Data:** 88 raw materials, Jan–Jun 2026.\n\n"
-                    "**I can answer:**\n"
-                    "- Material consumption (daily & monthly)\n"
-                    "- Stock variances — losses & gains\n"
-                    "- Top materials & category breakdowns\n"
-                    "- Month-by-month trends\n\n"
-                    "All figures come directly from the stores register. "
-                    "I never invent numbers.",
-                    elem_id="info-panel",
+            with gr.Row():
+                msg = gr.Textbox(
+                    placeholder="Ask about materials, variances, trends...",
+                    show_label=False, container=False, scale=8, autofocus=True,
                 )
+                send = gr.Button("Ask", variant="primary", scale=1, min_width=80)
+            mic = gr.Audio(sources=["microphone"], type="filepath",
+                           label="Or speak your question", show_label=True)
 
-    # ---------- chat plumbing ----------
+    gr.HTML('<div id="netrisyl-footer">Lobels Stores Assistant — Prototype · '
+            'Answers only from loaded stores data · Powered by Netrisyl Insights</div>')
+
+    # ---------- plumbing ----------
     def respond(message, history):
         if not message or not message.strip():
             return "", history or []
@@ -478,24 +548,20 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
         return "", history
 
     msg.submit(respond, [msg, chatbot], [msg, chatbot])
+    send.click(respond, [msg, chatbot], [msg, chatbot])
 
+    # voice -> transcribe -> put in textbox -> answer
+    mic.stop_recording(transcribe, inputs=mic, outputs=msg).then(
+        respond, [msg, chatbot], [msg, chatbot])
+
+    # material finder
+    finder_btn.click(material_snapshot, inputs=material_dd, outputs=finder_out)
+    material_dd.change(material_snapshot, inputs=material_dd, outputs=finder_out)
+
+    # suggested questions
     for btn, q in zip(suggest_btns, SUGGESTED):
         btn.click(lambda x=q: x, outputs=msg).then(
             respond, [msg, chatbot], [msg, chatbot])
-
-    netrisyl_img_html = (
-        f'<img src="{NETRISYL_DATA_URI}" alt="Netrisyl Insights"/>'
-        if NETRISYL_DATA_URI else '<span class="label" style="color:#C9A55C;">Netrisyl Insights</span>'
-    )
-    gr.HTML(f"""
-    <div id="netrisyl-footer">
-        <p class="prototype-note">Lobels Stores Assistant &mdash; Prototype. The bot only answers from loaded stores data.</p>
-        <div class="powered-row">
-            <span class="label">Powered by</span>
-            {netrisyl_img_html}
-        </div>
-    </div>
-    """)
 
 
 if __name__ == "__main__":
