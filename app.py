@@ -1,19 +1,19 @@
-# ============================================================
-# LOBELS BISCUITS — STORES AI ASSISTANT
-# Netrisyl Insights
-# ============================================================
-# Stack: Gradio + Supabase Postgres + GPT-4o-mini
-# Pattern: GPT tool-calling returns query params, Python runs
-#          the SQL — figures stay out of GPT's hands.
-# ============================================================
+"""
+LOBELS BISCUITS — STORES AI ASSISTANT
+=====================================
+Netrisyl Insights
+Stack: Gradio + Supabase Postgres + GPT-4o-mini
+Pattern: GPT tool-calling returns query params, Python runs the SQL.
+Design: three-column layout, Lobels blue/red brand palette.
+"""
 
 import os
 import json
+import datetime
 import gradio as gr
 from supabase import create_client, Client
 from openai import OpenAI
 
-# ── Credentials (set as Secrets in HF Space settings) ───────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 OPENAI_KEY   = os.environ.get("OPENAI_API_KEY", "")
@@ -25,158 +25,128 @@ CLIENT_ID = "lobels"
 MONTH_ORDER = ["JAN","FEB","MAR","APR","MAY","JUN",
                "JUL","AUG","SEP","OCT","NOV","DEC"]
 
-# ============================================================
-# SECTION 1 — DATA ACCESS FUNCTIONS (Python runs the queries)
-# ============================================================
+LOBELS_BLUE = "#1B4DB1"
+LOBELS_RED  = "#E2231A"
+LOBELS_DARK = "#0F2E6E"
 
-def q_material_total(stock_code=None, description=None, month=None):
-    """Total issues for a material, optionally filtered by month."""
+
+def _num(v):
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+
+def q_material_total(description=None, month=None):
     qry = supabase.table("lobels_stores").select(
-        "description, daily_issues, total_issues, month"
-    ).eq("client_id", CLIENT_ID)
-    if stock_code:
-        qry = qry.eq("stock_code", str(stock_code))
+        "description, daily_issues, month").eq("client_id", CLIENT_ID)
     if description:
         qry = qry.ilike("description", f"%{description}%")
     if month:
         qry = qry.eq("month", month.upper())
     rows = qry.execute().data
     if not rows:
-        return {"found": False}
-    total = sum(float(r["daily_issues"] or 0) for r in rows)
-    name = rows[0]["description"]
-    return {"found": True, "material": name, "total_issues_kg": round(total, 2),
-            "month": month or "all months", "rows": len(rows)}
+        return {"found": False, "searched_for": description}
+    total = sum(_num(r["daily_issues"]) for r in rows)
+    return {"found": True, "material": rows[0]["description"],
+            "total_issues_kg": round(total, 2),
+            "period": month.upper() if month else "all months (Jan-Jun 2026)"}
 
 
 def q_top_materials(month=None, limit=10):
-    """Top materials by total issues."""
     qry = supabase.table("lobels_stores").select(
-        "description, daily_issues, month"
-    ).eq("client_id", CLIENT_ID)
+        "description, daily_issues, month").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
     rows = qry.execute().data
     agg = {}
     for r in rows:
-        agg[r["description"]] = agg.get(r["description"], 0) + float(r["daily_issues"] or 0)
+        agg[r["description"]] = agg.get(r["description"], 0) + _num(r["daily_issues"])
     ranked = sorted(agg.items(), key=lambda x: -x[1])[:limit]
-    return {"month": month or "all months",
+    return {"period": month.upper() if month else "all months",
             "top": [{"material": m, "issues_kg": round(v, 2)} for m, v in ranked]}
 
 
 def q_variances(month=None, flag="LOSS", limit=10):
-    """Materials with biggest losses or gains."""
     qry = supabase.table("lobels_stores").select(
-        "description, variance, month, txn_date"
-    ).eq("client_id", CLIENT_ID)
+        "description, variance, month").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
     rows = qry.execute().data
-    agg = {}
+    seen = {}
     for r in rows:
-        agg[r["description"]] = agg.get(r["description"], 0) + float(r["variance"] or 0)
+        seen[(r["description"], r["month"])] = _num(r["variance"])
+    agg = {}
+    for (mat, mth), var in seen.items():
+        agg[mat] = agg.get(mat, 0) + var
     if flag == "LOSS":
         ranked = sorted(agg.items(), key=lambda x: x[1])[:limit]
     else:
         ranked = sorted(agg.items(), key=lambda x: -x[1])[:limit]
-    return {"month": month or "all months", "type": flag,
+    return {"period": month.upper() if month else "all months", "type": flag,
             "items": [{"material": m, "variance_kg": round(v, 2)} for m, v in ranked]}
 
 
 def q_category_breakdown(month=None):
-    """Total issues grouped by category."""
     qry = supabase.table("lobels_stores").select(
-        "category, daily_issues, month"
-    ).eq("client_id", CLIENT_ID)
+        "category, daily_issues, month").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
     rows = qry.execute().data
     agg = {}
     for r in rows:
         cat = r["category"] or "Other"
-        agg[cat] = agg.get(cat, 0) + float(r["daily_issues"] or 0)
+        agg[cat] = agg.get(cat, 0) + _num(r["daily_issues"])
     ranked = sorted(agg.items(), key=lambda x: -x[1])
-    return {"month": month or "all months",
+    return {"period": month.upper() if month else "all months",
             "categories": [{"category": c, "issues_kg": round(v, 2)} for c, v in ranked]}
 
 
 def q_monthly_trend(description):
-    """Month-by-month issues for one material."""
     rows = supabase.table("lobels_stores").select(
-        "description, daily_issues, month"
-    ).eq("client_id", CLIENT_ID).ilike("description", f"%{description}%").execute().data
+        "description, daily_issues, month").eq("client_id", CLIENT_ID
+        ).ilike("description", f"%{description}%").execute().data
     if not rows:
-        return {"found": False}
+        return {"found": False, "searched_for": description}
     agg = {}
     for r in rows:
-        agg[r["month"]] = agg.get(r["month"], 0) + float(r["daily_issues"] or 0)
+        agg[r["month"]] = agg.get(r["month"], 0) + _num(r["daily_issues"])
     ordered = [{"month": m, "issues_kg": round(agg.get(m, 0), 2)}
                for m in MONTH_ORDER if m in agg]
     return {"found": True, "material": rows[0]["description"], "trend": ordered}
 
 
-def q_reorder_status():
-    """Materials and their latest physical closing vs reorder point."""
-    mats = supabase.table("lobels_materials").select("*").execute().data
-    out = []
-    for m in mats:
-        if not m.get("reorder_point"):
-            continue
-        latest = supabase.table("lobels_stores").select(
-            "physical_closing, txn_date"
-        ).eq("client_id", CLIENT_ID).eq("stock_code", m["stock_code"]
-        ).order("txn_date", desc=True).limit(1).execute().data
-        closing = float(latest[0]["physical_closing"]) if latest else 0
-        rop = float(m["reorder_point"])
-        status = "REORDER NOW" if closing <= rop else "OK"
-        out.append({"material": m["description"], "closing_kg": round(closing, 1),
-                    "reorder_point_kg": round(rop, 1), "status": status})
-    return {"reorder_status": out}
-
-
-# ============================================================
-# SECTION 2 — GPT TOOL DEFINITIONS
-# ============================================================
 TOOLS = [
     {"type": "function", "function": {
         "name": "q_material_total",
-        "description": "Total kg issued for a specific raw material, optionally for one month.",
+        "description": "Total kg issued for a specific raw material, optionally for one month. Use a SHORT distinctive part of the name e.g. 'National Foods', 'Sugar', 'Palm Oil', 'Hex Flour' - the search matches partially.",
         "parameters": {"type": "object", "properties": {
-            "description": {"type": "string", "description": "Material name e.g. 'Flour National Foods', 'Sugar', 'Palm Oil'"},
-            "month": {"type": "string", "description": "Three-letter month e.g. JAN, FEB. Omit for full year."}
+            "description": {"type": "string", "description": "Distinctive part of material name. Prefer short fragments e.g. 'National Foods' not 'Flour National Foods Industrial'."},
+            "month": {"type": "string", "description": "Three-letter month e.g. JAN. Omit for full year."}
         }, "required": ["description"]}}},
     {"type": "function", "function": {
         "name": "q_top_materials",
         "description": "Top materials ranked by total kg issued.",
         "parameters": {"type": "object", "properties": {
-            "month": {"type": "string", "description": "Three-letter month. Omit for all months."},
-            "limit": {"type": "integer", "description": "How many to return, default 10."}
-        }}}},
+            "month": {"type": "string"}, "limit": {"type": "integer"}}}}},
     {"type": "function", "function": {
         "name": "q_variances",
-        "description": "Materials with biggest stock losses or gains (variances).",
+        "description": "Materials with biggest stock losses or gains.",
         "parameters": {"type": "object", "properties": {
             "month": {"type": "string"},
-            "flag": {"type": "string", "enum": ["LOSS", "GAIN"], "description": "LOSS for shortages, GAIN for surplus."},
-            "limit": {"type": "integer"}
-        }}}},
+            "flag": {"type": "string", "enum": ["LOSS", "GAIN"]},
+            "limit": {"type": "integer"}}}}},
     {"type": "function", "function": {
         "name": "q_category_breakdown",
-        "description": "Total issues grouped by material category (Flour, Sugar, Fats, etc).",
+        "description": "Total issues grouped by material category.",
         "parameters": {"type": "object", "properties": {
-            "month": {"type": "string"}
-        }}}},
+            "month": {"type": "string"}}}}},
     {"type": "function", "function": {
         "name": "q_monthly_trend",
         "description": "Month-by-month consumption trend for one material.",
         "parameters": {"type": "object", "properties": {
-            "description": {"type": "string"}
+            "description": {"type": "string", "description": "Distinctive part of material name."}
         }, "required": ["description"]}}},
-    {"type": "function", "function": {
-        "name": "q_reorder_status",
-        "description": "Which materials are at or below their reorder point and need reordering.",
-        "parameters": {"type": "object", "properties": {}}}},
 ]
 
 FUNC_MAP = {
@@ -185,44 +155,38 @@ FUNC_MAP = {
     "q_variances": q_variances,
     "q_category_breakdown": q_category_breakdown,
     "q_monthly_trend": q_monthly_trend,
-    "q_reorder_status": q_reorder_status,
 }
 
-SYSTEM_PROMPT = """You are the Lobels Biscuits Stores AI Assistant, built by Netrisyl Insights.
-You answer questions about raw material stores data: consumption, variances, reorder status, and trends.
+TODAY = datetime.date.today().strftime("%d %B %Y")
+SYSTEM_PROMPT = f"""You are the Lobels Biscuits Stores AI Assistant, built by Netrisyl Insights.
+Today's date is {TODAY}.
+You answer questions about raw material stores data: consumption, variances, and trends.
 You have data for January to June 2026 across 88 raw materials.
 
 Rules:
-- ALWAYS use a tool to fetch real figures. Never invent numbers.
+- ALWAYS use a tool to fetch real figures. NEVER invent numbers.
+- When searching for a material, pass a SHORT distinctive fragment of its name
+  (e.g. 'National Foods', 'Sugar', 'Palm Oil') so partial matching works.
 - Quote figures exactly as returned by the tools, in kilograms (kg).
-- Be concise and professional. Use plain language a stores manager understands.
-- If a question is outside stores data (e.g. HR, finance), politely say it's outside your scope.
-- Months in the data: JAN, FEB, MAR, APR, MAY, JUN (2026).
-- If no data is found for a material, say so clearly rather than guessing.
+- Be concise and professional, in plain language a stores manager understands.
+- If a question is outside stores data (HR, finance, etc.), politely say it's out of scope.
+- Months available: JAN, FEB, MAR, APR, MAY, JUN (2026).
+- If no data is found for a material, say so clearly and suggest checking the name.
 """
 
 
-# ============================================================
-# SECTION 3 — CHAT HANDLER
-# ============================================================
 def chat_fn(message, history):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for h in history:
-        if isinstance(h, dict):
-            messages.append(h)
+    for h in (history or []):
+        if isinstance(h, dict) and h.get("role") in ("user", "assistant"):
+            messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": message})
 
-    # First call — let GPT pick a tool
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
-        temperature=0,
-    )
+        model="gpt-4o-mini", messages=messages,
+        tools=TOOLS, tool_choice="auto", temperature=0)
     msg = resp.choices[0].message
 
-    # If GPT called tools, run them in Python and feed results back
     if msg.tool_calls:
         messages.append({"role": "assistant", "content": msg.content or "",
                          "tool_calls": [tc.model_dump() for tc in msg.tool_calls]})
@@ -238,49 +202,78 @@ def chat_fn(message, history):
         final = client.chat.completions.create(
             model="gpt-4o-mini", messages=messages, temperature=0)
         return final.choices[0].message.content
-
     return msg.content or "I couldn't find an answer to that."
 
 
-# ============================================================
-# SECTION 4 — GRADIO UI
-# ============================================================
-NETRISYL_ORANGE = "#B85C2A"
+LOGO_EXISTS = os.path.exists("logo.png")
 
 QUICK_QUESTIONS = [
     "Which materials had the highest losses?",
     "How much Flour National Foods did we use in January?",
     "Top 10 materials by consumption",
     "Compare sugar use across months",
-    "Which materials need reordering?",
     "Break down consumption by category",
 ]
 
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="orange"),
-               title="Lobels Stores AI Assistant") as demo:
-    gr.Markdown(
-        f"""
-        <div style="text-align:center;padding:8px;">
-          <h2 style="color:{NETRISYL_ORANGE};margin-bottom:0;">Lobels Biscuits — Stores AI Assistant</h2>
-          <p style="color:#666;margin-top:4px;">Powered by Netrisyl Insights · Jan–Jun 2026 data</p>
+CSS = f"""
+.gradio-container {{max-width: 1200px !important;}}
+#lobels-header {{
+    background: linear-gradient(135deg, {LOBELS_BLUE} 0%, {LOBELS_DARK} 100%);
+    border-radius: 14px; padding: 18px 24px; margin-bottom: 14px;
+    display: flex; align-items: center; gap: 18px;
+}}
+#lobels-header img {{height: 64px; width: auto;
+    background: #fff; border-radius: 10px; padding: 4px;}}
+#lobels-header .title {{color: #fff;}}
+#lobels-header .title h1 {{margin: 0; font-size: 22px; font-weight: 700;}}
+#lobels-header .title p {{margin: 2px 0 0; font-size: 13px; opacity: .85;}}
+.side-label {{color: {LOBELS_BLUE}; font-size: 12px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 1px; margin: 8px 0 6px;}}
+#lobels-footer {{text-align: center; color: #888; font-size: 12px;
+    margin-top: 14px; padding-top: 10px; border-top: 1px solid #eee;}}
+"""
+
+with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"),
+               css=CSS, title="Lobels Stores AI Assistant") as demo:
+
+    logo_tag = '<img src="/gradio_api/file=logo.png" alt="Lobels"/>' if LOGO_EXISTS else ""
+    gr.HTML(f"""
+        <div id="lobels-header">
+          {logo_tag}
+          <div class="title">
+            <h1>Lobels Biscuits &mdash; Stores AI Assistant</h1>
+            <p>Powered by Netrisyl Insights &middot; Raw material data Jan&ndash;Jun 2026</p>
+          </div>
         </div>
-        """)
-
-    chatbot = gr.Chatbot(height=420, type="messages",
-                         avatar_images=(None, "logo.png") if os.path.exists("logo.png") else None)
-    msg = gr.Textbox(placeholder="Ask about materials, variances, reorder alerts, trends...",
-                     label="", scale=8)
+    """)
 
     with gr.Row():
-        for q in QUICK_QUESTIONS[:3]:
-            gr.Button(q, size="sm").click(
-                lambda x=q: x, outputs=msg)
-    with gr.Row():
-        for q in QUICK_QUESTIONS[3:]:
-            gr.Button(q, size="sm").click(
-                lambda x=q: x, outputs=msg)
+        with gr.Column(scale=1, min_width=240):
+            gr.HTML('<div class="side-label">Suggested questions</div>')
+            q_buttons = [gr.Button(q, size="sm") for q in QUICK_QUESTIONS]
+            gr.HTML('<div class="side-label" style="margin-top:18px;">What I can do</div>')
+            gr.Markdown(
+                "- Material consumption (daily & monthly)\n"
+                "- Stock variances (losses & gains)\n"
+                "- Top materials & category breakdowns\n"
+                "- Month-by-month trends")
+
+        with gr.Column(scale=3):
+            chatbot = gr.Chatbot(
+                height=480, type="messages",
+                avatar_images=(None, "logo.png") if LOGO_EXISTS else None,
+                show_copy_button=True)
+            with gr.Row():
+                msg = gr.Textbox(
+                    placeholder="Ask about materials, variances, trends...",
+                    show_label=False, scale=8)
+                send = gr.Button("Ask", variant="primary", scale=1)
+
+    gr.HTML('<div id="lobels-footer">Netrisyl Insights &middot; netrisyl.com</div>')
 
     def respond(message, chat_history):
+        if not message or not message.strip():
+            return "", chat_history or []
         chat_history = chat_history or []
         reply = chat_fn(message, chat_history)
         chat_history.append({"role": "user", "content": message})
@@ -288,10 +281,10 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="orange"),
         return "", chat_history
 
     msg.submit(respond, [msg, chatbot], [msg, chatbot])
-
-    gr.Markdown(
-        f"""<div style="text-align:center;color:#999;font-size:12px;margin-top:10px;">
-        Netrisyl Insights · netrisyl.com</div>""")
+    send.click(respond, [msg, chatbot], [msg, chatbot])
+    for btn, q in zip(q_buttons, QUICK_QUESTIONS):
+        btn.click(lambda x=q: x, outputs=msg).then(
+            respond, [msg, chatbot], [msg, chatbot])
 
 if __name__ == "__main__":
     demo.launch()
