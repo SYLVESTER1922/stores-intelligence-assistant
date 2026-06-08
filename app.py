@@ -711,6 +711,125 @@ theme = gr.themes.Soft(
 )
 
 
+# ---------------------------------------------------------------------------
+# Admin functions
+# ---------------------------------------------------------------------------
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "netrisyl2026")
+
+
+def get_sync_status():
+    """Last sync date and row counts per month."""
+    try:
+        latest = sb.table("lobels_stores").select(
+            "txn_date").eq("client_id", CLIENT_ID
+            ).order("txn_date", desc=True).limit(1).execute().data
+        last_date = latest[0]["txn_date"] if latest else "Unknown"
+        counts = sb.table("lobels_stores").select(
+            "month", count="exact").eq("client_id", CLIENT_ID
+            ).execute()
+        month_rows = sb.table("lobels_stores").select(
+            "month").eq("client_id", CLIENT_ID).execute().data
+        agg = {}
+        for r in month_rows:
+            m = r["month"]
+            agg[m] = agg.get(m, 0) + 1
+        month_lines = "\n".join(
+            f"- **{m}:** {agg[m]:,} rows"
+            for m in MONTH_ORDER if m in agg)
+        mat_count = sb.table("lobels_materials").select(
+            "stock_code", count="exact").execute()
+        return (f"### ✅ Data Sync Status\n\n"
+                f"**Last transaction date:** {last_date}\n\n"
+                f"**Total daily rows:** {counts.count:,}\n\n"
+                f"**Materials in master:** {mat_count.count}\n\n"
+                f"**Rows by month:**\n{month_lines}")
+    except Exception as e:
+        return f"### ⚠️ Could not fetch sync status\n{str(e)}"
+
+
+def get_data_quality():
+    """Data quality checks."""
+    try:
+        rows = sb.table("lobels_stores").select(
+            "description, variance_flag, variance, month"
+        ).eq("client_id", CLIENT_ID).execute().data
+        total = len(rows)
+        losses = [r for r in rows if r.get("variance_flag") == "LOSS"]
+        gains  = [r for r in rows if r.get("variance_flag") == "GAIN"]
+        ok     = [r for r in rows if r.get("variance_flag") == "OK"]
+        mats_no_cost = sb.table("lobels_materials").select(
+            "description, unit_cost_usd").execute().data
+        no_cost = [m["description"] for m in mats_no_cost
+                   if not m.get("unit_cost_usd")]
+        lines = [
+            "### 📊 Data Quality Report\n",
+            f"**Total rows:** {total:,}",
+            f"**OK variance rows:** {len(ok):,}",
+            f"**LOSS rows:** {len(losses):,}",
+            f"**GAIN rows:** {len(gains):,}",
+        ]
+        if no_cost:
+            lines.append(f"\n**⚠️ Materials missing unit cost ({len(no_cost)}):**")
+            for n in no_cost[:10]:
+                lines.append(f"- {n}")
+            if len(no_cost) > 10:
+                lines.append(f"- …and {len(no_cost)-10} more")
+        else:
+            lines.append("\n**✅ All materials have unit cost data**")
+        return "\n\n".join(lines)
+    except Exception as e:
+        return f"### ⚠️ Could not run quality check\n{str(e)}"
+
+
+def admin_login(password, action):
+    if password != ADMIN_PASSWORD:
+        return "### ❌ Incorrect password. Access denied."
+    if action == "sync_status":
+        return get_sync_status()
+    elif action == "data_quality":
+        return get_data_quality()
+    return "### Select an action above."
+
+
+# ---------------------------------------------------------------------------
+# Material Lookup tab — full-page expanded finder with monthly trend
+# ---------------------------------------------------------------------------
+def material_full_lookup(material_name):
+    if not material_name:
+        return "Select a material to see its full profile.", ""
+    # Snapshot (same as sidebar)
+    snap = material_snapshot(material_name)
+    # Monthly trend
+    trend = q_monthly_trend(material_name)
+    if not trend.get("found"):
+        trend_md = "No monthly trend data found."
+    else:
+        lines = [f"### Monthly Trend — {trend['material']}\n",
+                 "| Month | Issued (kg) |",
+                 "|---|---|"]
+        for t in trend["trend"]:
+            lines.append(f"| {t['month']} | {_fmt(t['issues_kg'])} |")
+        trend_md = "\n".join(lines)
+    # Materials Master info
+    mat = sb.table("lobels_materials").select("*").ilike(
+        "description", f"%{material_name}%").execute().data
+    if mat:
+        m = mat[0]
+        master_md = (
+            f"### Reference Data\n"
+            f"- **Supplier:** {m.get('supplier') or 'Not set'}\n"
+            f"- **Unit Cost:** ${_fmt(_num(m.get('unit_cost_usd')))} /kg\n"
+            f"- **Reorder Point:** {_fmt(_num(m.get('reorder_point')))} kg\n"
+            f"- **Lead Time:** {m.get('lead_time_days') or '?'} days\n"
+        )
+    else:
+        master_md = ""
+    return snap + "\n\n" + master_md, trend_md
+
+
+# ---------------------------------------------------------------------------
+# UI — Three tabs: Chat · Material Lookup · Admin
+# ---------------------------------------------------------------------------
 with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) as demo:
 
     logo_img_html = (f'<img class="logo" src="{LOGO_DATA_URI}" alt="Lobels"/>'
@@ -734,61 +853,130 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
     </div>
     """)
 
-    with gr.Row():
-        # LEFT SIDEBAR - Material Finder + Suggested Questions
-        with gr.Column(scale=1, min_width=260):
-            with gr.Group(elem_classes=["sidebar-card"]):
-                gr.HTML("<h3>Raw Material Finder</h3>")
-                material_dd = gr.Dropdown(
-                    choices=MATERIAL_NAMES,
-                    label="Select a material",
-                    show_label=False,
-                    container=False,
-                    filterable=True,
-                )
-                finder_btn = gr.Button("Get latest snapshot", variant="primary", size="sm")
-                finder_out = gr.Markdown("", elem_id="finder-result")
+    with gr.Tabs():
 
-        # MAIN CHAT - wider (scale 3)
-        with gr.Column(scale=3):
-            chatbot = gr.Chatbot(
-                type="messages",
-                height=560,
-                avatar_images=(None, str(LOGO_PATH) if LOGO_PATH.exists() else None),
-                show_label=False,
-                show_copy_button=True,
-            )
+        # ================================================================
+        # TAB 1 — CHAT
+        # ================================================================
+        with gr.Tab("💬 Chat"):
             with gr.Row():
-                msg = gr.Textbox(
-                    placeholder="Ask about materials, variances, trends...",
-                    show_label=False, container=False, scale=8, autofocus=True,
-                )
-                send = gr.Button("Ask", variant="primary", scale=1, min_width=80)
-            mic = gr.Audio(sources=["microphone"], type="filepath",
-                           label="Or speak your question", show_label=True)
+                # LEFT SIDEBAR - Material Finder
+                with gr.Column(scale=1, min_width=260):
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Raw Material Finder</h3>")
+                        material_dd = gr.Dropdown(
+                            choices=MATERIAL_NAMES,
+                            label="Select a material",
+                            show_label=False,
+                            container=False,
+                            filterable=True,
+                        )
+                        finder_btn = gr.Button("Get latest snapshot",
+                                               variant="primary", size="sm")
+                        finder_out = gr.Markdown("", elem_id="finder-result")
 
-        # RIGHT SIDEBAR - Quick Reports + Suggested Questions
-        with gr.Column(scale=1, min_width=260):
-            with gr.Group(elem_classes=["sidebar-card"]):
-                gr.HTML("<h3>Quick Reports</h3>")
-                with gr.Row():
-                    btn_reorder = gr.Button("🔄 Reorder Alerts", size="sm")
-                    btn_losses  = gr.Button("📉 Top Losses", size="sm")
-                with gr.Row():
-                    btn_spend   = gr.Button("💵 Monthly Spend", size="sm")
-                    btn_runout  = gr.Button("⏳ Run-out Risks", size="sm")
-                report_out = gr.Markdown("", elem_id="finder-result")
+                # MAIN CHAT
+                with gr.Column(scale=3):
+                    chatbot = gr.Chatbot(
+                        type="messages", height=520,
+                        avatar_images=(
+                            None, str(LOGO_PATH) if LOGO_PATH.exists() else None),
+                        show_label=False, show_copy_button=True,
+                    )
+                    with gr.Row():
+                        msg = gr.Textbox(
+                            placeholder="Ask about materials, variances, trends...",
+                            show_label=False, container=False, scale=8, autofocus=True,
+                        )
+                        send = gr.Button("Ask", variant="primary",
+                                         scale=1, min_width=80)
+                    mic = gr.Audio(sources=["microphone"], type="filepath",
+                                   label="Or speak your question", show_label=True)
 
-            with gr.Group(elem_classes=["sidebar-card"]):
-                gr.HTML("<h3>Suggested Questions</h3>")
-                suggest_btns = [
-                    gr.Button(q, elem_classes=["suggest-btn"]) for q in SUGGESTED
-                ]
+                # RIGHT SIDEBAR - Quick Reports + Suggested Questions
+                with gr.Column(scale=1, min_width=260):
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Quick Reports</h3>")
+                        with gr.Row():
+                            btn_reorder = gr.Button("🔄 Reorder Alerts", size="sm")
+                            btn_losses  = gr.Button("📉 Top Losses", size="sm")
+                        with gr.Row():
+                            btn_spend   = gr.Button("💵 Monthly Spend", size="sm")
+                            btn_runout  = gr.Button("⏳ Run-out Risks", size="sm")
+                        report_out = gr.Markdown("", elem_id="finder-result")
 
-    gr.HTML('<div id="netrisyl-footer">Lobels Stores Assistant — Prototype · '
-            'Answers only from loaded stores data · Powered by Netrisyl Insights</div>')
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Suggested Questions</h3>")
+                        suggest_btns = [
+                            gr.Button(q, elem_classes=["suggest-btn"])
+                            for q in SUGGESTED
+                        ]
 
-    # ---------- plumbing ----------
+        # ================================================================
+        # TAB 2 — MATERIAL LOOKUP
+        # ================================================================
+        with gr.Tab("🔍 Material Lookup"):
+            with gr.Row():
+                with gr.Column(scale=1, min_width=280):
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Select Material</h3>")
+                        lookup_dd = gr.Dropdown(
+                            choices=MATERIAL_NAMES,
+                            show_label=False,
+                            container=False,
+                            filterable=True,
+                        )
+                        lookup_btn = gr.Button(
+                            "Get full profile", variant="primary")
+
+                with gr.Column(scale=2):
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Snapshot &amp; Reference Data</h3>")
+                        lookup_snap = gr.Markdown(
+                            "Select a material and click 'Get full profile'.",
+                            elem_id="finder-result")
+
+                with gr.Column(scale=2):
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Monthly Trend</h3>")
+                        lookup_trend = gr.Markdown("", elem_id="finder-result")
+
+        # ================================================================
+        # TAB 3 — ADMIN
+        # ================================================================
+        with gr.Tab("⚙️ Admin"):
+            gr.Markdown(
+                "### Lobels Stores — Admin Panel\n"
+                "Password-protected. Enter the admin password to access data tools.")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    admin_pwd = gr.Textbox(
+                        label="Admin Password", type="password", container=True)
+                    with gr.Row():
+                        btn_sync_status = gr.Button(
+                            "📡 Sync Status", variant="primary")
+                        btn_quality = gr.Button(
+                            "📊 Data Quality", variant="secondary")
+                with gr.Column(scale=2):
+                    admin_out = gr.Markdown(
+                        "Enter password and select an action.",
+                        elem_id="finder-result")
+
+    # footer
+    netrisyl_footer = (f'<img src="{NETRISYL_DATA_URI}" alt="Netrisyl Insights"/>'
+                       if NETRISYL_DATA_URI else "Netrisyl Insights")
+    gr.HTML(f"""
+    <div id="netrisyl-footer">
+        <p class="prototype-note">Lobels Stores Assistant &mdash; Prototype.
+        Answers only from loaded stores data.</p>
+        <div class="powered-row">
+            <span class="label">Powered by</span>
+            {netrisyl_footer}
+        </div>
+    </div>
+    """)
+
+    # ── Chat tab plumbing ──
     def respond(message, history):
         if not message or not message.strip():
             return "", history or []
@@ -800,25 +988,33 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
 
     msg.submit(respond, [msg, chatbot], [msg, chatbot])
     send.click(respond, [msg, chatbot], [msg, chatbot])
-
-    # voice -> transcribe -> put in textbox -> answer
     mic.stop_recording(transcribe, inputs=mic, outputs=msg).then(
         respond, [msg, chatbot], [msg, chatbot])
-
-    # material finder
     finder_btn.click(material_snapshot, inputs=material_dd, outputs=finder_out)
     material_dd.change(material_snapshot, inputs=material_dd, outputs=finder_out)
-
-    # quick reports
     btn_reorder.click(report_reorder, outputs=report_out)
     btn_losses.click(report_losses, outputs=report_out)
     btn_spend.click(report_spend, outputs=report_out)
     btn_runout.click(report_runout, outputs=report_out)
-
-    # suggested questions
     for btn, q in zip(suggest_btns, SUGGESTED):
         btn.click(lambda x=q: x, outputs=msg).then(
             respond, [msg, chatbot], [msg, chatbot])
+
+    # ── Material Lookup tab plumbing ──
+    lookup_btn.click(
+        material_full_lookup, inputs=lookup_dd,
+        outputs=[lookup_snap, lookup_trend])
+    lookup_dd.change(
+        material_full_lookup, inputs=lookup_dd,
+        outputs=[lookup_snap, lookup_trend])
+
+    # ── Admin tab plumbing ──
+    btn_sync_status.click(
+        lambda pwd: admin_login(pwd, "sync_status"),
+        inputs=admin_pwd, outputs=admin_out)
+    btn_quality.click(
+        lambda pwd: admin_login(pwd, "data_quality"),
+        inputs=admin_pwd, outputs=admin_out)
 
 
 if __name__ == "__main__":
