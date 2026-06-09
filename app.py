@@ -1108,7 +1108,6 @@ PLOTLY_LAYOUT = dict(
     plot_bgcolor="white",
     paper_bgcolor="white",
     margin=dict(l=10, r=20, t=50, b=40),
-    height=420,
 )
 
 def _empty_fig(msg="No data available"):
@@ -1277,7 +1276,7 @@ def chart_monthly_spend():
         text=[f"${_fmt(v)}" for v in values],
         textposition="outside", textfont=dict(size=10)))
     fig.update_layout(title="Monthly Materials Cost (USD) — 2026",
-                      yaxis_title="Value (USD)", **PLOTLY_LAYOUT)
+                      yaxis_title="Value (USD)", height=420, **PLOTLY_LAYOUT)
     total = sum(values)
     summary = (
         f"### 💵 Monthly Spend\n**Total: ${_fmt(total)}**\n\n"
