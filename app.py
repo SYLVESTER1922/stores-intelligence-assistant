@@ -216,6 +216,79 @@ def report_runout():
     return "\n".join(lines)
 
 
+def report_abc():
+    """ABC classification summary."""
+    res = q_abc_classification()
+    if "error" in res:
+        return f"### 🏷️ ABC Classification\n\n{res['error']}"
+    total = res["total_value_usd"]
+    a = res["A"]
+    b = res["B"]
+    c = res["C"]
+    lines = [
+        f"### 🏷️ ABC Inventory Classification",
+        f"**Total inventory value: ${_fmt(total)}**\n",
+        f"**Class A — Critical ({a['count']} materials, 80% of value)**",
+        f"_{a['description']}_",
+    ]
+    for m in a["materials"][:5]:
+        lines.append(f"- {m['material']} — ${_fmt(m['annual_value_usd'])} "
+                     f"({m['value_pct']}%)")
+    if len(a["materials"]) > 5:
+        lines.append(f"  …and {len(a['materials'])-5} more Class A materials")
+    lines += [
+        f"\n**Class B — Important ({b['count']} materials, 15% of value)**",
+        f"_{b['description']}_",
+        f"\n**Class C — Low value ({c['count']} materials, 5% of value)**",
+        f"_{c['description']}_",
+    ]
+    return "\n\n".join(lines)
+
+
+def report_purchasing_priority():
+    """Purchasing priority list summary."""
+    res = q_purchasing_priority()
+    items = res.get("priority_list", [])
+    critical = [i for i in items if i["urgency_score"] >= 9]
+    urgent   = [i for i in items if 6 <= i["urgency_score"] < 9]
+    lines = [
+        f"### 📋 Purchasing Priority List",
+        f"**{res['critical_count']} critical · {res['urgent_count']} urgent** "
+        f"out of {res['total_assessed']} assessed\n",
+    ]
+    if critical:
+        lines.append("**🔴 Order Immediately:**")
+        for i in critical[:8]:
+            lines.append(
+                f"**{i['material']}** — {_fmt(i['current_stock_kg'])} kg left, "
+                f"{i['days_left']} days · {i['lead_time_days']}d lead · "
+                f"_{i.get('supplier','?')}_")
+    if urgent:
+        lines.append("\n**🟠 Order Soon:**")
+        for i in urgent[:5]:
+            lines.append(
+                f"**{i['material']}** — {_fmt(i['current_stock_kg'])} kg · "
+                f"{i['days_left']} days left")
+    return "\n\n".join(lines)
+
+
+def report_production_risk():
+    """Critical production risk summary."""
+    res = q_production_risk()
+    items = res.get("top_risks", [])
+    lines = [
+        f"### ⚠️ Critical Production Risk Monitor",
+        f"**{res['total_at_risk']} materials** pose critical production risk.\n",
+    ]
+    for i in items[:10]:
+        lines.append(
+            f"{i['status']} **{i['material']}**  \n"
+            f"   Stock: {_fmt(i['current_stock_kg'])} kg · "
+            f"~{i['days_left']} days left · "
+            f"Daily value: ${_fmt(i['daily_value_usd'])}")
+    return "\n\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Voice input (Whisper transcription)
 # ---------------------------------------------------------------------------
@@ -427,6 +500,133 @@ def q_runout_forecast(description):
             "lead_time_days": lead, "alert": alert}
 
 
+def q_abc_classification():
+    """ABC classification: A=top 80% of value, B=next 15%, C=bottom 5%."""
+    mats = sb.table("lobels_materials").select(
+        "description, unit_cost_usd").execute().data
+    cost_map = {m["description"]: _num(m.get("unit_cost_usd")) for m in mats}
+    rows = sb.table("lobels_stores").select(
+        "description, daily_issues").eq("client_id", CLIENT_ID).execute().data
+    # total issued value per material
+    spend = {}
+    for r in rows:
+        d = r["description"]
+        spend[d] = spend.get(d, 0) + _num(r["daily_issues"]) * cost_map.get(d, 0)
+    ranked = sorted(spend.items(), key=lambda x: -x[1])
+    total = sum(spend.values())
+    if total == 0:
+        return {"error": "No value data available."}
+    cumulative = 0
+    classes = []
+    for name, val in ranked:
+        cumulative += val
+        pct = cumulative / total * 100
+        cls = "A" if pct <= 80 else "B" if pct <= 95 else "C"
+        classes.append({"material": name, "annual_value_usd": round(val, 2),
+                        "value_pct": round(val / total * 100, 1), "class": cls})
+    a = [c for c in classes if c["class"] == "A"]
+    b = [c for c in classes if c["class"] == "B"]
+    c = [c for c in classes if c["class"] == "C"]
+    return {
+        "total_value_usd": round(total, 2),
+        "A": {"count": len(a), "materials": a,
+              "description": "Critical — 80% of total value. Manage tightly."},
+        "B": {"count": len(b), "materials": b,
+              "description": "Important — 15% of value. Monitor regularly."},
+        "C": {"count": len(c), "materials": c,
+              "description": "Low value — 5% of value. Simple controls sufficient."},
+    }
+
+
+def q_purchasing_priority():
+    """Rank materials by urgency for replenishment."""
+    mats = sb.table("lobels_materials").select("*").execute().data
+    results = []
+    for m in mats:
+        name = m["description"]
+        rop = _num(m.get("reorder_point"))
+        lead = _num(m.get("lead_time_days"))
+        cost = _num(m.get("unit_cost_usd"))
+        if rop <= 0 or lead <= 0:
+            continue
+        closing = _latest_closing(name)
+        if closing is None:
+            continue
+        rows = sb.table("lobels_stores").select(
+            "daily_issues").eq("client_id", CLIENT_ID
+            ).ilike("description", f"%{name}%").execute().data
+        issues = [_num(r["daily_issues"]) for r in rows if _num(r["daily_issues"]) > 0]
+        if not issues:
+            continue
+        avg_daily = sum(issues) / len(issues)
+        days_left = round(closing / avg_daily, 1) if avg_daily > 0 else 9999
+        days_to_rop = round((closing - rop) / avg_daily, 1) if avg_daily > 0 else 9999
+        # Urgency score: lower days_left relative to lead_time = more urgent
+        # Score 1-10: 10 = critical (already below ROP or running out before lead time)
+        if closing <= 0:
+            score = 10
+        elif days_left <= lead:
+            score = 9
+        elif closing <= rop:
+            score = 8
+        elif days_left <= lead * 1.5:
+            score = 6
+        elif days_left <= lead * 2:
+            score = 4
+        else:
+            score = 2
+        results.append({
+            "material": name,
+            "urgency_score": score,
+            "current_stock_kg": round(closing, 1),
+            "reorder_point_kg": round(rop, 1),
+            "avg_daily_use_kg": round(avg_daily, 1),
+            "days_left": days_left,
+            "lead_time_days": int(lead),
+            "order_value_usd": round(rop * cost, 2),
+            "supplier": m.get("supplier"),
+            "status": ("🔴 CRITICAL" if score >= 9 else
+                      "🟠 URGENT" if score >= 6 else
+                      "🟡 MONITOR" if score >= 4 else "🟢 OK"),
+        })
+    results.sort(key=lambda x: -x["urgency_score"])
+    critical = [r for r in results if r["urgency_score"] >= 9]
+    urgent = [r for r in results if 6 <= r["urgency_score"] < 9]
+    return {
+        "total_assessed": len(results),
+        "critical_count": len(critical),
+        "urgent_count": len(urgent),
+        "priority_list": results[:20],
+    }
+
+
+def q_production_risk():
+    """Materials posing the greatest risk of disrupting production."""
+    priority = q_purchasing_priority()
+    items = priority.get("priority_list", [])
+    # Risk = urgency + value impact (high-value + critical = highest risk)
+    mats_cost = {m["description"]: _num(m.get("unit_cost_usd"))
+                 for m in sb.table("lobels_materials").select(
+                     "description, unit_cost_usd").execute().data}
+    risk_items = []
+    for item in items:
+        cost = mats_cost.get(item["material"], 0)
+        daily_value = item["avg_daily_use_kg"] * cost
+        risk_score = item["urgency_score"] * (1 + min(daily_value / 1000, 5))
+        item["daily_value_usd"] = round(daily_value, 2)
+        item["risk_score"] = round(risk_score, 1)
+        risk_items.append(item)
+    risk_items.sort(key=lambda x: -x["risk_score"])
+    critical = [r for r in risk_items if r["urgency_score"] >= 8]
+    return {
+        "total_at_risk": len(critical),
+        "top_risks": risk_items[:10],
+        "message": (f"{len(critical)} materials pose critical production risk"
+                    if critical else "No critical production risks detected."),
+    }
+
+
+
 TOOLS = [
     {"type": "function", "function": {
         "name": "q_material_total",
@@ -481,6 +681,18 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "description": {"type": "string", "description": "Distinctive part of material name."}
         }, "required": ["description"]}}},
+    {"type": "function", "function": {
+        "name": "q_abc_classification",
+        "description": "ABC inventory classification — A (top 80% of value), B (next 15%), C (bottom 5%). Use for 'ABC analysis', 'which materials are most critical by value', 'inventory classification'.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "q_purchasing_priority",
+        "description": "Ranked purchasing priority list — scores all materials by urgency using stock, reorder point, daily consumption and lead time. Use for 'what should we order', 'purchasing priorities', 'what needs ordering urgently'.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "q_production_risk",
+        "description": "Critical production risk monitor — materials most likely to disrupt production, combining stock urgency with daily value impact. Use for 'production risk', 'what could stop production', 'critical materials'.",
+        "parameters": {"type": "object", "properties": {}}}},
 ]
 
 FUNC_MAP = {
@@ -493,13 +705,17 @@ FUNC_MAP = {
     "q_material_cost": q_material_cost,
     "q_supplier_lookup": q_supplier_lookup,
     "q_runout_forecast": q_runout_forecast,
+    "q_abc_classification": q_abc_classification,
+    "q_purchasing_priority": q_purchasing_priority,
+    "q_production_risk": q_production_risk,
 }
 
 TODAY = date.today().strftime("%d %B %Y")
 SYSTEM_PROMPT = f"""You are the Lobels Biscuits Stores AI Assistant, built by Netrisyl Insights.
 Today's date is {TODAY}.
 You answer questions about raw material stores data: consumption, variances, trends,
-reorder status, costs/spend (in USD), suppliers, and run-out forecasts.
+reorder status, costs/spend (in USD), suppliers, run-out forecasts, ABC classification,
+purchasing priorities, and production risk.
 You have data for January to June 2026 across 88 raw materials.
 
 Rules:
@@ -507,8 +723,9 @@ Rules:
 - When searching for a material, pass a SHORT distinctive fragment of its name
   (e.g. 'National Foods', 'Sugar', 'Palm Oil') so partial matching works.
 - Quote figures exactly as returned by the tools. Quantities in kilograms (kg), money in USD ($).
-- For reorder, cost, supplier, or run-out questions, use the matching tool.
-- Be concise and professional, in plain language a stores manager understands.
+- For reorder, cost, supplier, run-out, ABC, purchasing priority or production risk questions,
+  use the matching tool.
+- Be concise and professional, in plain language a COO or stores manager understands.
 - If a question is outside stores data, politely say it's out of scope.
 - Months available: JAN, FEB, MAR, APR, MAY, JUN (2026).
 - If no data is found for a material, say so clearly.
@@ -546,12 +763,12 @@ def chat_answer(message, history):
 
 
 SUGGESTED = [
+    "What materials pose the highest production risk?",
+    "Give me the purchasing priority list",
+    "Run an ABC classification of our inventory",
     "Which materials need reordering?",
     "What did we spend on Flour National Foods in March?",
-    "Who supplies our sugar?",
-    "When will we run out of Palm Oil?",
     "Which materials had the highest losses?",
-    "Top 10 materials by consumption",
 ]
 
 
@@ -903,6 +1120,11 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
                         with gr.Row():
                             btn_spend   = gr.Button("💵 Monthly Spend", size="sm")
                             btn_runout  = gr.Button("⏳ Run-out Risks", size="sm")
+                        with gr.Row():
+                            btn_abc      = gr.Button("🏷️ ABC Analysis", size="sm")
+                            btn_priority = gr.Button("📋 Buy Priority", size="sm")
+                        with gr.Row():
+                            btn_prodrisk = gr.Button("⚠️ Production Risk", size="sm")
                         report_out = gr.Markdown("", elem_id="finder-result")
 
                     with gr.Group(elem_classes=["sidebar-card"]):
@@ -996,6 +1218,9 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
     btn_losses.click(report_losses, outputs=report_out)
     btn_spend.click(report_spend, outputs=report_out)
     btn_runout.click(report_runout, outputs=report_out)
+    btn_abc.click(report_abc, outputs=report_out)
+    btn_priority.click(report_purchasing_priority, outputs=report_out)
+    btn_prodrisk.click(report_production_risk, outputs=report_out)
     for btn, q in zip(suggest_btns, SUGGESTED):
         btn.click(lambda x=q: x, outputs=msg).then(
             respond, [msg, chatbot], [msg, chatbot])
