@@ -329,7 +329,7 @@ def q_top_materials(month=None, limit=10):
         "description, daily_issues, month").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
-    rows = qry.execute().data
+    rows = qry.limit(10000).execute().data
     agg = {}
     for r in rows:
         agg[r["description"]] = agg.get(r["description"], 0) + _num(r["daily_issues"])
@@ -402,18 +402,17 @@ def _latest_closing(description):
 
 def _batch_store_data():
     """Fetch all lobels_stores rows ONCE and return closing + avg-daily maps.
-    Replaces per-material queries — reduces ~176 calls to just 1."""
+    Uses limit(10000) to override Supabase's default 1000 row cap."""
     rows = sb.table("lobels_stores").select(
         "description, physical_closing, daily_issues, txn_date"
-    ).eq("client_id", CLIENT_ID).execute().data
+    ).eq("client_id", CLIENT_ID).limit(10000).execute().data
 
-    closing_map = {}          # description -> latest physical_closing
-    daily_sum   = {}          # description -> sum of positive daily_issues
-    daily_cnt   = {}          # description -> count of positive daily_issues
+    closing_map = {}
+    daily_sum   = {}
+    daily_cnt   = {}
 
     for r in rows:
         d = r["description"]
-        # latest closing: keep the row with the highest txn_date
         if d not in closing_map or str(r["txn_date"]) > str(closing_map[d][0]):
             closing_map[d] = (r["txn_date"], _num(r["physical_closing"]))
         v = _num(r["daily_issues"])
@@ -421,7 +420,7 @@ def _batch_store_data():
             daily_sum[d] = daily_sum.get(d, 0) + v
             daily_cnt[d] = daily_cnt.get(d, 0) + 1
 
-    closing  = {d: v for d, (_, v) in closing_map.items()}
+    closing   = {d: v for d, (_, v) in closing_map.items()}
     avg_daily = {d: daily_sum[d] / daily_cnt[d] for d in daily_sum}
     return closing, avg_daily
 
@@ -1261,19 +1260,24 @@ def chart_losses():
 
 @_safe
 def chart_monthly_spend():
+    # Get unit costs from materials master
+    mats = sb.table("lobels_materials").select(
+        "description, unit_cost_usd").execute().data
+    cost_map = {m["description"]: _num(m.get("unit_cost_usd")) for m in mats}
+    # Get all daily issues with month (limit 10000 to get all rows)
     rows = sb.table("lobels_stores").select(
-        "month, value_usd, daily_issues, unit_cost_usd"
-    ).eq("client_id", CLIENT_ID).execute().data
+        "month, description, daily_issues"
+    ).eq("client_id", CLIENT_ID).limit(10000).execute().data
+    # Compute value = daily_issues × unit_cost per month
     agg = {}
     for r in rows:
         m = r["month"]
-        v = _num(r.get("value_usd")) or (
-            _num(r.get("daily_issues")) * _num(r.get("unit_cost_usd")))
+        v = _num(r["daily_issues"]) * cost_map.get(r["description"], 0)
         agg[m] = agg.get(m, 0) + v
     months = [m for m in MONTH_ORDER if m in agg]
     values = [agg[m] for m in months]
     month  = _latest_month()
-    colors = [C_GOLD if m==month else C_NAVY for m in months]
+    colors = [C_GOLD if m == month else C_NAVY for m in months]
     fig = go.Figure(go.Bar(
         x=months, y=values, marker_color=colors,
         text=[f"${_fmt(v)}" for v in values],
@@ -1284,7 +1288,7 @@ def chart_monthly_spend():
     summary = (
         f"### 💵 Monthly Spend\n**Total: ${_fmt(total)}**\n\n"
         "| Month | Value (USD) |\n|---|---|\n" +
-        "\n".join(f"| **{m}** | ${_fmt(v)} |" for m,v in zip(months,values)))
+        "\n".join(f"| **{m}** | ${_fmt(v)} |" for m, v in zip(months, values)))
     return fig, summary
 
 
