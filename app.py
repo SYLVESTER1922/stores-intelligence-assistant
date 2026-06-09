@@ -400,17 +400,27 @@ def _latest_closing(description):
     return _num(rows[0]["physical_closing"])
 
 
-def _batch_store_data():
-    """Fetch all lobels_stores rows ONCE and return closing + avg-daily maps.
-    Uses limit(10000) to override Supabase's default 1000 row cap."""
-    rows = sb.table("lobels_stores").select(
-        "description, physical_closing, daily_issues, txn_date"
-    ).eq("client_id", CLIENT_ID).limit(10000).execute().data
+def _query_all(columns):
+    """Paginate through lobels_stores to get every row, bypassing server row caps."""
+    all_rows = []
+    start = 0
+    page = 1000
+    while True:
+        batch = sb.table("lobels_stores").select(columns).eq(
+            "client_id", CLIENT_ID).range(start, start + page - 1).execute().data
+        all_rows.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
+    return all_rows
 
+
+def _batch_store_data():
+    """Fetch ALL store rows using pagination, return closing + avg-daily maps."""
+    rows = _query_all("description, physical_closing, daily_issues, txn_date")
     closing_map = {}
     daily_sum   = {}
     daily_cnt   = {}
-
     for r in rows:
         d = r["description"]
         if d not in closing_map or str(r["txn_date"]) > str(closing_map[d][0]):
@@ -419,7 +429,6 @@ def _batch_store_data():
         if v > 0:
             daily_sum[d] = daily_sum.get(d, 0) + v
             daily_cnt[d] = daily_cnt.get(d, 0) + 1
-
     closing   = {d: v for d, (_, v) in closing_map.items()}
     avg_daily = {d: daily_sum[d] / daily_cnt[d] for d in daily_sum}
     return closing, avg_daily
@@ -1264,10 +1273,8 @@ def chart_monthly_spend():
     mats = sb.table("lobels_materials").select(
         "description, unit_cost_usd").execute().data
     cost_map = {m["description"]: _num(m.get("unit_cost_usd")) for m in mats}
-    # Get all daily issues with month (limit 10000 to get all rows)
-    rows = sb.table("lobels_stores").select(
-        "month, description, daily_issues"
-    ).eq("client_id", CLIENT_ID).limit(10000).execute().data
+    # Paginate to get ALL rows (bypasses Supabase's server-side row cap)
+    rows = _query_all("month, description, daily_issues")
     # Compute value = daily_issues × unit_cost per month
     agg = {}
     for r in rows:
@@ -1336,29 +1343,32 @@ def chart_runout():
         if c is None or a <= 0:
             continue
         dleft = round(c / a, 1)
-        if dleft <= lead * 1.5:
-            risks.append({"material": name[:35], "days_left": dleft,
+        if dleft < lead:   # only materials that run out BEFORE lead time
+            risks.append({"material": name[:30], "days_left": dleft,
                           "lead_time": lead, "supplier": m.get("supplier")})
     risks.sort(key=lambda x: x["days_left"])
-    risks = risks[:12]
+    risks = risks[:10]    # top 10 most critical only — keeps chart clean
     if not risks:
         return _empty_fig("No run-out risks detected ✅"), "All materials have adequate stock."
-    names  = [r["material"] for r in reversed(risks)]
-    days   = [r["days_left"] for r in reversed(risks)]
-    leads  = [r["lead_time"] for r in reversed(risks)]
-    colors = [C_RED if d<=l else C_ORANGE for d,l in zip(days,leads)]
+    names = [r["material"] for r in risks]
+    days  = [r["days_left"] for r in risks]
+    leads = [r["lead_time"] for r in risks]
+    # Grouped bars: red/orange = stock days, navy = lead time required
     fig = go.Figure()
-    fig.add_trace(go.Bar(name="Days of Stock Left", x=days, y=names,
-                         orientation="h", marker_color=colors))
-    fig.add_trace(go.Scatter(
-        x=leads, y=names, mode="markers",
-        marker=dict(symbol="line-ns", size=14, color=C_NAVY,
-                    line=dict(width=3, color=C_NAVY)),
-        name="Lead Time (days)"))
-    fig.update_layout(title="Run-out Forecast — Days of Stock vs Lead Time",
-                      xaxis_title="Days",
-                      legend=dict(orientation="h", y=1.12),
-                      **_layout(height=480, margin=dict(l=220, r=20, t=50, b=40)))
+    fig.add_trace(go.Bar(
+        name="Days of Stock Left", x=names, y=days,
+        marker_color=[C_RED if d <= l * 0.5 else C_ORANGE
+                      for d, l in zip(days, leads)],
+        text=[f"{d}d" for d in days], textposition="outside"))
+    fig.add_trace(go.Bar(
+        name="Lead Time Required (days)", x=names, y=leads,
+        marker_color=C_NAVY, opacity=0.5,
+        text=[f"{l}d" for l in leads], textposition="outside"))
+    fig.update_layout(
+        title="Run-out Risk — Stock Days vs Lead Time",
+        yaxis_title="Days", barmode="group",
+        legend=dict(orientation="h", y=1.12),
+        **_layout(height=440, margin=dict(l=20, r=20, t=70, b=100)))
     critical = [r for r in risks if r["days_left"] <= r["lead_time"]]
     summary = (
         f"### ⏳ Run-out Forecast\n"
