@@ -646,93 +646,33 @@ def q_abc_classification():
     }
 
 
-def q_purchasing_priority():
-    """Rank materials by urgency for replenishment."""
+def q_reorder_status(description=None):
+    """Materials at or below reorder point."""
     mats = sb.table("lobels_materials").select("*").execute().data
-    results = []
+    closing, _ = _batch_store_data()
+    if description:
+        mats = [m for m in mats
+                if description.lower() in (m.get("description") or "").lower()]
+    out = []
     for m in mats:
-        name = m["description"]
         rop = _num(m.get("reorder_point"))
-        lead = _num(m.get("lead_time_days"))
-        cost = _num(m.get("unit_cost_usd"))
-        if rop <= 0 or lead <= 0:
+        if rop <= 0:
             continue
-        closing = _latest_closing(name)
-        if closing is None:
+        c = closing.get(m["description"])
+        if c is None:
             continue
-        rows = sb.table("lobels_stores").select(
-            "daily_issues").eq("client_id", CLIENT_ID
-            ).ilike("description", f"%{name}%").execute().data
-        issues = [_num(r["daily_issues"]) for r in rows if _num(r["daily_issues"]) > 0]
-        if not issues:
-            continue
-        avg_daily = sum(issues) / len(issues)
-        days_left = round(closing / avg_daily, 1) if avg_daily > 0 else 9999
-        days_to_rop = round((closing - rop) / avg_daily, 1) if avg_daily > 0 else 9999
-        # Urgency score: lower days_left relative to lead_time = more urgent
-        # Score 1-10: 10 = critical (already below ROP or running out before lead time)
-        if closing <= 0:
-            score = 10
-        elif days_left <= lead:
-            score = 9
-        elif closing <= rop:
-            score = 8
-        elif days_left <= lead * 1.5:
-            score = 6
-        elif days_left <= lead * 2:
-            score = 4
-        else:
-            score = 2
-        results.append({
-            "material": name,
-            "urgency_score": score,
-            "current_stock_kg": round(closing, 1),
+        out.append({
+            "material": m["description"],
+            "current_stock_kg": round(c, 1),
             "reorder_point_kg": round(rop, 1),
-            "avg_daily_use_kg": round(avg_daily, 1),
-            "days_left": days_left,
-            "lead_time_days": int(lead),
-            "order_value_usd": round(rop * cost, 2),
+            "status": "REORDER NOW" if c <= rop else "OK",
             "supplier": m.get("supplier"),
-            "status": ("🔴 CRITICAL" if score >= 9 else
-                      "🟠 URGENT" if score >= 6 else
-                      "🟡 MONITOR" if score >= 4 else "🟢 OK"),
+            "lead_time_days": m.get("lead_time_days"),
         })
-    results.sort(key=lambda x: -x["urgency_score"])
-    critical = [r for r in results if r["urgency_score"] >= 9]
-    urgent = [r for r in results if 6 <= r["urgency_score"] < 9]
-    return {
-        "total_assessed": len(results),
-        "critical_count": len(critical),
-        "urgent_count": len(urgent),
-        "priority_list": results[:20],
-    }
-
-
-def q_production_risk():
-    """Materials posing the greatest risk of disrupting production."""
-    priority = q_purchasing_priority()
-    items = priority.get("priority_list", [])
-    # Risk = urgency + value impact (high-value + critical = highest risk)
-    mats_cost = {m["description"]: _num(m.get("unit_cost_usd"))
-                 for m in sb.table("lobels_materials").select(
-                     "description, unit_cost_usd").execute().data}
-    risk_items = []
-    for item in items:
-        cost = mats_cost.get(item["material"], 0)
-        daily_value = item["avg_daily_use_kg"] * cost
-        risk_score = item["urgency_score"] * (1 + min(daily_value / 1000, 5))
-        item["daily_value_usd"] = round(daily_value, 2)
-        item["risk_score"] = round(risk_score, 1)
-        risk_items.append(item)
-    risk_items.sort(key=lambda x: -x["risk_score"])
-    critical = [r for r in risk_items if r["urgency_score"] >= 8]
-    return {
-        "total_at_risk": len(critical),
-        "top_risks": risk_items[:10],
-        "message": (f"{len(critical)} materials pose critical production risk"
-                    if critical else "No critical production risks detected."),
-    }
-
+    out.sort(key=lambda x: (x["status"] != "REORDER NOW", x["material"]))
+    needing = [o for o in out if o["status"] == "REORDER NOW"]
+    return {"checked": len(out), "needing_reorder": len(needing),
+            "items": out if description else (needing or out[:10])}
 
 
 TOOLS = [
@@ -1187,9 +1127,241 @@ def _safe(fn):
             return fn(*args, **kwargs)
         except Exception as e:
             print(f"Chart error [{fn.__name__}]: {e}")
-            return _empty_fig(f"Could not load report. Try again."), f"⚠️ {str(e)[:200]}"
+            return _empty_fig("Could not load report. Try again."), f"⚠️ {str(e)[:200]}"
     return wrapper
 
+
+@_safe
+def chart_abc():
+    res = q_abc_classification()
+    if "error" in res:
+        return _empty_fig(res["error"]), "No ABC data."
+    all_mats = (res["A"]["materials"] + res["B"]["materials"] +
+                res["C"]["materials"])[:20]
+    names  = [m["material"][:35] for m in reversed(all_mats)]
+    values = [m["annual_value_usd"] for m in reversed(all_mats)]
+    cls    = [m["class"] for m in reversed(all_mats)]
+    colors = [C_RED if c=="A" else C_ORANGE if c=="B" else C_GREEN for c in cls]
+    fig = go.Figure(go.Bar(
+        x=values, y=names, orientation="h", marker_color=colors,
+        text=[f"${_fmt(v)} · {c}" for v,c in zip(values,cls)],
+        textposition="auto", textfont=dict(color="white", size=10)))
+    fig.update_layout(title="ABC Classification — Value by Material (USD)",
+                      xaxis_title="Total Value (USD)", **PLOTLY_LAYOUT,
+                      height=520, margin=dict(l=220, r=20, t=50, b=40))
+    a,b,c_ = res["A"], res["B"], res["C"]
+    summary = (
+        f"### 🏷️ ABC Classification\n**Total: ${_fmt(res['total_value_usd'])}**\n\n"
+        f"| Class | Count | Share | Action |\n|---|---|---|---|\n"
+        f"| 🔴 **A** | {a['count']} | 80% | Daily monitoring |\n"
+        f"| 🟠 **B** | {b['count']} | 15% | Weekly review |\n"
+        f"| 🟢 **C** | {c_['count']} | 5% | Simple controls |\n\n"
+        "**Top Class A:**\n" +
+        "\n".join(f"- **{m['material']}** — ${_fmt(m['annual_value_usd'])} ({m['value_pct']}%)"
+                  for m in a["materials"][:6]))
+    return fig, summary
+
+
+@_safe
+def chart_purchasing_priority():
+    res = q_purchasing_priority()
+    items = res.get("priority_list", [])[:15]
+    if not items:
+        return _empty_fig("No materials assessed."), "No data."
+    names  = [i["material"][:35] for i in reversed(items)]
+    scores = [i["urgency_score"] for i in reversed(items)]
+    days   = [i["days_left"] for i in reversed(items)]
+    colors = [C_RED if s>=9 else C_ORANGE if s>=6 else C_YELLOW if s>=4 else C_GREEN
+              for s in scores]
+    fig = go.Figure(go.Bar(
+        x=scores, y=names, orientation="h", marker_color=colors,
+        text=[f"{d}d left · score {s}" for s,d in zip(scores,days)],
+        textposition="auto", textfont=dict(size=10)))
+    fig.update_layout(title="Purchasing Priority — Urgency Score (10=Critical)",
+                      xaxis=dict(title="Urgency Score", range=[0,10]),
+                      **PLOTLY_LAYOUT, height=520,
+                      margin=dict(l=220, r=20, t=50, b=40))
+    critical = [i for i in items if i["urgency_score"] >= 9]
+    urgent   = [i for i in items if 6 <= i["urgency_score"] < 9]
+    summary = (
+        f"### 📋 Purchasing Priority\n"
+        f"**{res['critical_count']} critical · {res['urgent_count']} urgent** "
+        f"of {res['total_assessed']} assessed\n\n"
+        "**🔴 Order Immediately:**\n" +
+        "\n".join(f"- **{i['material']}** — {_fmt(i['current_stock_kg'])} kg, "
+                  f"{i['days_left']}d left, {i['lead_time_days']}d lead · "
+                  f"_{i.get('supplier','?')}_" for i in critical[:6]) +
+        ("\n\n**🟠 Order Soon:**\n" +
+         "\n".join(f"- **{i['material']}** — {i['days_left']}d left"
+                   for i in urgent[:4]) if urgent else ""))
+    return fig, summary
+
+
+@_safe
+def chart_production_risk():
+    res = q_production_risk()
+    items = res.get("top_risks", [])[:12]
+    if not items:
+        return _empty_fig("No production risks detected."), "All clear."
+    names  = [i["material"][:35] for i in reversed(items)]
+    scores = [i["risk_score"] for i in reversed(items)]
+    vals   = [i["daily_value_usd"] for i in reversed(items)]
+    colors = [C_RED if i["urgency_score"]>=9 else
+              C_ORANGE if i["urgency_score"]>=6 else C_YELLOW
+              for i in reversed(items)]
+    fig = go.Figure(go.Bar(
+        x=scores, y=names, orientation="h", marker_color=colors,
+        text=[f"${_fmt(v)}/day" for v in vals],
+        textposition="auto", textfont=dict(size=10)))
+    fig.update_layout(title="Critical Production Risk — Combined Risk Score",
+                      xaxis_title="Risk Score", **PLOTLY_LAYOUT, height=480,
+                      margin=dict(l=220, r=20, t=50, b=40))
+    summary = (
+        f"### ⚠️ Production Risk\n{res['message']}\n\n"
+        "**Highest risk:**\n" +
+        "\n".join(f"- {i['status']} **{i['material']}** — "
+                  f"{_fmt(i['current_stock_kg'])} kg · {i['days_left']}d left · "
+                  f"${_fmt(i['daily_value_usd'])}/day" for i in items[:8]))
+    return fig, summary
+
+
+@_safe
+def chart_losses():
+    month = _latest_month()
+    res = q_variances(month=month, flag="LOSS", limit=12)
+    items = [i for i in res["items"] if i["variance_kg"] < 0]
+    if not items:
+        return _empty_fig("No losses recorded this month."), "No losses."
+    mats_cost = {m["description"]: _num(m.get("unit_cost_usd"))
+                 for m in sb.table("lobels_materials").select(
+                     "description, unit_cost_usd").execute().data}
+    names = [i["material"][:35] for i in reversed(items)]
+    usd   = [abs(i["variance_kg"]) * mats_cost.get(i["material"], 0)
+             for i in reversed(items)]
+    kgs   = [abs(i["variance_kg"]) for i in reversed(items)]
+    fig = go.Figure(go.Bar(
+        x=usd, y=names, orientation="h", marker_color=C_RED,
+        text=[f"${_fmt(u)} ({_fmt(k)} kg)" for u,k in zip(usd,kgs)],
+        textposition="auto", textfont=dict(color="white", size=10)))
+    fig.update_layout(title=f"Top Losses by Value — {month} 2026 (USD)",
+                      xaxis_title="Loss Value (USD)", **PLOTLY_LAYOUT, height=460,
+                      margin=dict(l=220, r=20, t=50, b=40))
+    total_usd = sum(abs(i["variance_kg"]) * mats_cost.get(i["material"], 0)
+                    for i in items)
+    summary = (
+        f"### 📉 Top Losses — {month} 2026\n"
+        f"**Total loss value: ${_fmt(total_usd)}**\n\n" +
+        "\n".join(f"- **{i['material']}** — {_fmt(i['variance_kg'])} kg · "
+                  f"≈ ${_fmt(abs(i['variance_kg']) * mats_cost.get(i['material'], 0))}"
+                  for i in items[:8]))
+    return fig, summary
+
+
+@_safe
+def chart_monthly_spend():
+    rows = sb.table("lobels_stores").select(
+        "month, value_usd, daily_issues, unit_cost_usd"
+    ).eq("client_id", CLIENT_ID).execute().data
+    agg = {}
+    for r in rows:
+        m = r["month"]
+        v = _num(r.get("value_usd")) or (
+            _num(r.get("daily_issues")) * _num(r.get("unit_cost_usd")))
+        agg[m] = agg.get(m, 0) + v
+    months = [m for m in MONTH_ORDER if m in agg]
+    values = [agg[m] for m in months]
+    month  = _latest_month()
+    colors = [C_GOLD if m==month else C_NAVY for m in months]
+    fig = go.Figure(go.Bar(
+        x=months, y=values, marker_color=colors,
+        text=[f"${_fmt(v)}" for v in values],
+        textposition="outside", textfont=dict(size=10)))
+    fig.update_layout(title="Monthly Materials Cost (USD) — 2026",
+                      yaxis_title="Value (USD)", **PLOTLY_LAYOUT)
+    total = sum(values)
+    summary = (
+        f"### 💵 Monthly Spend\n**Total: ${_fmt(total)}**\n\n"
+        "| Month | Value (USD) |\n|---|---|\n" +
+        "\n".join(f"| **{m}** | ${_fmt(v)} |" for m,v in zip(months,values)))
+    return fig, summary
+
+
+@_safe
+def chart_reorder():
+    res = q_reorder_status()
+    items = [i for i in res["items"] if i["status"]=="REORDER NOW"][:12]
+    if not items:
+        return _empty_fig("All materials above reorder point ✅"), "Nothing to reorder."
+    names = [i["material"][:35] for i in reversed(items)]
+    curr  = [i["current_stock_kg"] for i in reversed(items)]
+    rop   = [i["reorder_point_kg"] for i in reversed(items)]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="Current Stock (kg)", x=curr, y=names,
+                         orientation="h", marker_color=C_RED))
+    fig.add_trace(go.Bar(name="Reorder Point (kg)", x=rop, y=names,
+                         orientation="h", marker_color=C_NAVY, opacity=0.35))
+    fig.update_layout(title="Reorder Alerts — Current Stock vs Reorder Point",
+                      barmode="overlay", xaxis_title="Quantity (kg)",
+                      **PLOTLY_LAYOUT, height=480,
+                      margin=dict(l=220, r=20, t=50, b=40),
+                      legend=dict(orientation="h", y=1.12))
+    summary = (
+        f"### 🔄 Reorder Alerts\n"
+        f"**{res['needing_reorder']} of {res['checked']} materials** need reordering.\n\n" +
+        "\n".join(f"- **{i['material']}** — {_fmt(i['current_stock_kg'])} kg "
+                  f"(ROP: {_fmt(i['reorder_point_kg'])} kg) · "
+                  f"{i.get('supplier','?')} · {i.get('lead_time_days','?')}d lead"
+                  for i in items[:8]))
+    return fig, summary
+
+
+@_safe
+def chart_runout():
+    """Run-out forecast — BATCHED: 2 Supabase calls only."""
+    mats = sb.table("lobels_materials").select("*").execute().data
+    closing, avg_daily = _batch_store_data()
+    risks = []
+    for m in mats:
+        name = m["description"]
+        lead = _num(m.get("lead_time_days"))
+        if lead <= 0:
+            continue
+        c = closing.get(name)
+        a = avg_daily.get(name, 0)
+        if c is None or a <= 0:
+            continue
+        dleft = round(c / a, 1)
+        if dleft <= lead * 1.5:
+            risks.append({"material": name[:35], "days_left": dleft,
+                          "lead_time": lead, "supplier": m.get("supplier")})
+    risks.sort(key=lambda x: x["days_left"])
+    risks = risks[:12]
+    if not risks:
+        return _empty_fig("No run-out risks detected ✅"), "All materials have adequate stock."
+    names  = [r["material"] for r in reversed(risks)]
+    days   = [r["days_left"] for r in reversed(risks)]
+    leads  = [r["lead_time"] for r in reversed(risks)]
+    colors = [C_RED if d<=l else C_ORANGE for d,l in zip(days,leads)]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="Days of Stock Left", x=days, y=names,
+                         orientation="h", marker_color=colors))
+    fig.add_trace(go.Scatter(
+        x=leads, y=names, mode="markers",
+        marker=dict(symbol="line-ns", size=14, color=C_NAVY,
+                    line=dict(width=3, color=C_NAVY)),
+        name="Lead Time (days)"))
+    fig.update_layout(title="Run-out Forecast — Days of Stock vs Lead Time",
+                      xaxis_title="Days", **PLOTLY_LAYOUT, height=480,
+                      margin=dict(l=220, r=20, t=50, b=40),
+                      legend=dict(orientation="h", y=1.12))
+    critical = [r for r in risks if r["days_left"] <= r["lead_time"]]
+    summary = (
+        f"### ⏳ Run-out Forecast\n"
+        f"**{len(critical)} materials** will run out before new stock arrives.\n\n" +
+        "\n".join(f"- **{r['material']}** — ~{r['days_left']}d left · "
+                  f"{r['lead_time']}d lead · _{r.get('supplier','?')}_"
+                  for r in risks[:8]))
+    return fig, summary
 
 
 def chart_material_trend(material_name):
