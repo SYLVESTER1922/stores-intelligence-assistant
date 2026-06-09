@@ -13,6 +13,7 @@ from pathlib import Path
 from datetime import date, datetime
 
 import gradio as gr
+import plotly.graph_objects as go
 from supabase import create_client, Client
 from openai import OpenAI
 
@@ -1045,22 +1046,321 @@ def material_full_lookup(material_name):
 
 
 # ---------------------------------------------------------------------------
-# UI — Three tabs: Chat · Material Lookup · Admin
+# Chart helpers — Plotly figures for the Reports tab
+# ---------------------------------------------------------------------------
+C_NAVY  = "#1B2A4E"
+C_GOLD  = "#C9A55C"
+C_RED   = "#C0392B"
+C_ORANGE= "#E67E22"
+C_YELLOW= "#F1C40F"
+C_GREEN = "#27AE60"
+C_CREAM = "#F7F3EC"
+
+PLOTLY_LAYOUT = dict(
+    font=dict(family="Inter, Arial", size=12),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    margin=dict(l=10, r=20, t=50, b=40),
+    height=420,
+)
+
+def _empty_fig(msg="No data available"):
+    fig = go.Figure()
+    fig.add_annotation(text=msg, xref="paper", yref="paper",
+                       x=0.5, y=0.5, showarrow=False,
+                       font=dict(size=15, color="#999"))
+    fig.update_layout(**PLOTLY_LAYOUT)
+    return fig
+
+
+def chart_abc():
+    res = q_abc_classification()
+    if "error" in res:
+        return _empty_fig(res["error"]), "No ABC data."
+    all_mats = (res["A"]["materials"] + res["B"]["materials"] +
+                res["C"]["materials"])[:20]
+    names  = [m["material"][:35] for m in reversed(all_mats)]
+    values = [m["annual_value_usd"] for m in reversed(all_mats)]
+    cls    = [m["class"] for m in reversed(all_mats)]
+    colors = [C_RED if c == "A" else C_ORANGE if c == "B" else C_GREEN
+              for c in cls]
+    fig = go.Figure(go.Bar(
+        x=values, y=names, orientation="h",
+        marker_color=colors,
+        text=[f"${_fmt(v)} · {c}" for v, c in zip(values, cls)],
+        textposition="auto", textfont=dict(color="white", size=10),
+    ))
+    fig.update_layout(title="ABC Classification — Value by Material (USD)",
+                      xaxis_title="Total Value (USD)", **PLOTLY_LAYOUT,
+                      height=520, margin=dict(l=220, r=20, t=50, b=40))
+    a, b, c_ = res["A"], res["B"], res["C"]
+    total = res["total_value_usd"]
+    summary = (
+        f"### 🏷️ ABC Classification\n**Total value: ${_fmt(total)}**\n\n"
+        f"| Class | Materials | Share | Action |\n|---|---|---|---|\n"
+        f"| 🔴 **A — Critical** | {a['count']} | 80% | Daily monitoring, tight control |\n"
+        f"| 🟠 **B — Important** | {b['count']} | 15% | Weekly review |\n"
+        f"| 🟢 **C — Low value** | {c_['count']} | 5% | Simple controls |\n\n"
+        "**Top Class A materials:**\n" +
+        "\n".join(f"- **{m['material']}** — ${_fmt(m['annual_value_usd'])} "
+                  f"({m['value_pct']}%)" for m in a["materials"][:6])
+    )
+    return fig, summary
+
+
+def chart_purchasing_priority():
+    res = q_purchasing_priority()
+    items = res.get("priority_list", [])[:15]
+    if not items:
+        return _empty_fig("No materials assessed."), "No data."
+    names   = [i["material"][:35] for i in reversed(items)]
+    scores  = [i["urgency_score"] for i in reversed(items)]
+    days    = [i["days_left"] for i in reversed(items)]
+    colors  = [C_RED if s >= 9 else C_ORANGE if s >= 6
+               else C_YELLOW if s >= 4 else C_GREEN for s in scores]
+    fig = go.Figure(go.Bar(
+        x=scores, y=names, orientation="h",
+        marker_color=colors,
+        text=[f"{d}d left · score {s}" for s, d in zip(scores, days)],
+        textposition="auto", textfont=dict(size=10),
+    ))
+    fig.update_layout(
+        title="Purchasing Priority — Urgency Score (10 = Critical)",
+        xaxis=dict(title="Urgency Score", range=[0, 10]),
+        **PLOTLY_LAYOUT, height=520,
+        margin=dict(l=220, r=20, t=50, b=40))
+    critical = [i for i in items if i["urgency_score"] >= 9]
+    urgent   = [i for i in items if 6 <= i["urgency_score"] < 9]
+    summary = (
+        f"### 📋 Purchasing Priority\n"
+        f"**{res['critical_count']} critical · {res['urgent_count']} urgent** "
+        f"of {res['total_assessed']} assessed\n\n"
+        "**🔴 Order Immediately:**\n" +
+        "\n".join(f"- **{i['material']}** — {_fmt(i['current_stock_kg'])} kg, "
+                  f"{i['days_left']}d left, {i['lead_time_days']}d lead · "
+                  f"_{i.get('supplier','?')}_" for i in critical[:6]) +
+        ("\n\n**🟠 Order Soon:**\n" +
+         "\n".join(f"- **{i['material']}** — {i['days_left']}d left"
+                   for i in urgent[:4]) if urgent else "")
+    )
+    return fig, summary
+
+
+def chart_production_risk():
+    res = q_production_risk()
+    items = res.get("top_risks", [])[:12]
+    if not items:
+        return _empty_fig("No production risks detected."), "All clear."
+    names  = [i["material"][:35] for i in reversed(items)]
+    scores = [i["risk_score"] for i in reversed(items)]
+    vals   = [i["daily_value_usd"] for i in reversed(items)]
+    colors = [C_RED if i["urgency_score"] >= 9 else
+              C_ORANGE if i["urgency_score"] >= 6 else C_YELLOW
+              for i in reversed(items)]
+    fig = go.Figure(go.Bar(
+        x=scores, y=names, orientation="h",
+        marker_color=colors,
+        text=[f"${_fmt(v)}/day · {i['status']}"
+              for v, i in zip(vals, list(reversed(items)))],
+        textposition="auto", textfont=dict(size=10),
+    ))
+    fig.update_layout(
+        title="Critical Production Risk — Combined Risk Score",
+        xaxis_title="Risk Score",
+        **PLOTLY_LAYOUT, height=480,
+        margin=dict(l=220, r=20, t=50, b=40))
+    summary = (
+        f"### ⚠️ Production Risk Monitor\n{res['message']}\n\n"
+        "**Highest risk materials:**\n" +
+        "\n".join(
+            f"- {i['status']} **{i['material']}** — "
+            f"{_fmt(i['current_stock_kg'])} kg · {i['days_left']}d left · "
+            f"${_fmt(i['daily_value_usd'])}/day"
+            for i in items[:8])
+    )
+    return fig, summary
+
+
+def chart_losses():
+    month = _latest_month()
+    res = q_variances(month=month, flag="LOSS", limit=12)
+    items = [i for i in res["items"] if i["variance_kg"] < 0]
+    if not items:
+        return _empty_fig("No losses recorded."), "No losses."
+    mats_cost = {m["description"]: _num(m.get("unit_cost_usd"))
+                 for m in sb.table("lobels_materials").select(
+                     "description, unit_cost_usd").execute().data}
+    names  = [i["material"][:35] for i in reversed(items)]
+    kgs    = [abs(i["variance_kg"]) for i in reversed(items)]
+    usd    = [abs(i["variance_kg"]) * mats_cost.get(i["material"], 0)
+              for i in reversed(items)]
+    fig = go.Figure(go.Bar(
+        x=usd, y=names, orientation="h",
+        marker_color=C_RED,
+        text=[f"${_fmt(u)} ({_fmt(k)} kg)" for u, k in zip(usd, kgs)],
+        textposition="auto", textfont=dict(color="white", size=10),
+    ))
+    fig.update_layout(
+        title=f"Top Losses by Value — {month} 2026 (USD)",
+        xaxis_title="Loss Value (USD)",
+        **PLOTLY_LAYOUT, height=460,
+        margin=dict(l=220, r=20, t=50, b=40))
+    total_usd = sum(abs(i["variance_kg"]) * mats_cost.get(i["material"], 0)
+                    for i in items)
+    summary = (
+        f"### 📉 Top Losses — {month} 2026\n"
+        f"**Total loss value: ${_fmt(total_usd)}**\n\n" +
+        "\n".join(f"- **{i['material']}** — {_fmt(i['variance_kg'])} kg · "
+                  f"≈ ${_fmt(abs(i['variance_kg']) * mats_cost.get(i['material'], 0))}"
+                  for i in items[:8])
+    )
+    return fig, summary
+
+
+def chart_monthly_spend():
+    month = _latest_month()
+    rows = sb.table("lobels_stores").select(
+        "month, value_usd").eq("client_id", CLIENT_ID).execute().data
+    agg = {}
+    for r in rows:
+        m = r["month"]
+        agg[m] = agg.get(m, 0) + _num(r.get("value_usd"))
+    months  = [m for m in MONTH_ORDER if m in agg]
+    values  = [agg[m] for m in months]
+    colors  = [C_GOLD if m == month else C_NAVY for m in months]
+    fig = go.Figure(go.Bar(
+        x=months, y=values, marker_color=colors,
+        text=[f"${_fmt(v)}" for v in values],
+        textposition="outside", textfont=dict(size=10),
+    ))
+    fig.update_layout(
+        title="Monthly Materials Cost (USD) — Jan–Jun 2026",
+        yaxis_title="Value (USD)",
+        **PLOTLY_LAYOUT)
+    total = sum(values)
+    summary = (
+        f"### 💵 Monthly Spend\n**Total Jan–Jun: ${_fmt(total)}**\n\n"
+        "| Month | Value (USD) |\n|---|---|\n" +
+        "\n".join(f"| {m} | ${_fmt(v)} |" for m, v in zip(months, values))
+    )
+    return fig, summary
+
+
+def chart_reorder():
+    res = q_reorder_status()
+    items = [i for i in res["items"] if i["status"] == "REORDER NOW"][:12]
+    if not items:
+        return _empty_fig("All materials above reorder point ✅"), "Nothing to reorder."
+    names  = [i["material"][:35] for i in reversed(items)]
+    curr   = [i["current_stock_kg"] for i in reversed(items)]
+    rop    = [i["reorder_point_kg"] for i in reversed(items)]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="Current Stock", x=curr, y=names,
+                         orientation="h", marker_color=C_RED))
+    fig.add_trace(go.Bar(name="Reorder Point", x=rop, y=names,
+                         orientation="h", marker_color=C_NAVY, opacity=0.4))
+    fig.update_layout(
+        title="Reorder Alerts — Current Stock vs Reorder Point (kg)",
+        barmode="overlay", xaxis_title="Quantity (kg)",
+        **PLOTLY_LAYOUT, height=480,
+        margin=dict(l=220, r=20, t=50, b=40),
+        legend=dict(orientation="h", y=1.1))
+    summary = (
+        f"### 🔄 Reorder Alerts\n"
+        f"**{res['needing_reorder']} of {res['checked']} materials** need reordering.\n\n" +
+        "\n".join(
+            f"- **{i['material']}** — {_fmt(i['current_stock_kg'])} kg "
+            f"(ROP: {_fmt(i['reorder_point_kg'])} kg) · {i.get('supplier','?')} · "
+            f"{i.get('lead_time_days','?')}d lead"
+            for i in items[:8])
+    )
+    return fig, summary
+
+
+def chart_runout():
+    mats = sb.table("lobels_materials").select("*").execute().data
+    risks = []
+    for m in mats:
+        lead = _num(m.get("lead_time_days"))
+        if lead <= 0:
+            continue
+        f = q_runout_forecast(m["description"])
+        dleft = f.get("estimated_days_left")
+        if dleft is not None and dleft <= lead * 1.5:
+            risks.append({"material": m["description"], "days_left": dleft,
+                          "lead_time": lead, "supplier": m.get("supplier")})
+    risks.sort(key=lambda x: x["days_left"])
+    risks = risks[:12]
+    if not risks:
+        return _empty_fig("No run-out risks detected ✅"), "All materials have adequate stock."
+    names  = [r["material"][:35] for r in reversed(risks)]
+    days   = [r["days_left"] for r in reversed(risks)]
+    leads  = [r["lead_time"] for r in reversed(risks)]
+    colors = [C_RED if d <= l else C_ORANGE for d, l in zip(days, leads)]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="Days of Stock Left", x=days, y=names,
+                         orientation="h", marker_color=colors))
+    fig.add_trace(go.Scatter(
+        x=leads, y=names, mode="markers",
+        marker=dict(symbol="line-ns", size=12, color=C_NAVY,
+                    line=dict(width=2, color=C_NAVY)),
+        name="Lead Time (days)"))
+    fig.update_layout(
+        title="Run-out Risk — Days of Stock vs Lead Time",
+        xaxis_title="Days", **PLOTLY_LAYOUT, height=480,
+        margin=dict(l=220, r=20, t=50, b=40),
+        legend=dict(orientation="h", y=1.1))
+    summary = (
+        f"### ⏳ Run-out Risks\n"
+        f"**{len([r for r in risks if r['days_left'] <= r['lead_time']])} "
+        f"materials** will run out before new stock arrives.\n\n" +
+        "\n".join(
+            f"- **{r['material']}** — ~{r['days_left']}d left · "
+            f"{r['lead_time']}d lead · _{r.get('supplier','?')}_"
+            for r in risks[:8])
+    )
+    return fig, summary
+
+
+def chart_material_trend(material_name):
+    """Monthly trend chart for Material Lookup tab."""
+    if not material_name:
+        return _empty_fig("Select a material to see its trend.")
+    trend = q_monthly_trend(material_name)
+    if not trend.get("found"):
+        return _empty_fig(f"No trend data for {material_name}.")
+    months = [t["month"] for t in trend["trend"]]
+    values = [t["issues_kg"] for t in trend["trend"]]
+    fig = go.Figure(go.Bar(
+        x=months, y=values,
+        marker_color=C_NAVY,
+        text=[_fmt(v) for v in values],
+        textposition="outside", textfont=dict(size=10),
+    ))
+    fig.update_layout(
+        title=f"Monthly Issued (kg) — {trend['material']}",
+        yaxis_title="Issued (kg)",
+        **PLOTLY_LAYOUT)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# UI — Four tabs: Chat · Reports · Material Lookup · Admin
 # ---------------------------------------------------------------------------
 with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) as demo:
 
     logo_img_html = (f'<img class="logo" src="{LOGO_DATA_URI}" alt="Lobels"/>'
                      if LOGO_DATA_URI else "")
-    powered_html = (f'<img src="{NETRISYL_DATA_URI}" alt="Netrisyl"/>'
-                    if NETRISYL_DATA_URI else '<div class="ni">Netrisyl Insights</div>')
+    powered_html  = (f'<img src="{NETRISYL_DATA_URI}" alt="Netrisyl"/>'
+                     if NETRISYL_DATA_URI else '<div class="ni">Netrisyl Insights</div>')
     gr.HTML(f"""
     <div id="lobels-hero">
         <div class="hero-left">
             {logo_img_html}
             <div class="titles">
                 <div class="brand-name">Lobels Biscuits &amp; Sweets</div>
-                <h1>Stores AI Assistant</h1>
-                <p class="tagline">Raw material consumption, stock variances and trends &middot; 2026</p>
+                <h1>Stores Intelligence Platform</h1>
+                <p class="tagline">Production cost intelligence &middot; Inventory risk &middot; Procurement analytics</p>
             </div>
         </div>
         <div class="powered">
@@ -1073,132 +1373,123 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
     with gr.Tabs():
 
         # ================================================================
-        # TAB 1 — CHAT
+        # TAB 1 — CHAT (simplified — just the AI assistant)
         # ================================================================
         with gr.Tab("💬 Chat"):
             with gr.Row():
-                # LEFT SIDEBAR - Material Finder
-                with gr.Column(scale=1, min_width=260):
+                # LEFT: Material Finder
+                with gr.Column(scale=1, min_width=240):
                     with gr.Group(elem_classes=["sidebar-card"]):
                         gr.HTML("<h3>Raw Material Finder</h3>")
                         material_dd = gr.Dropdown(
-                            choices=MATERIAL_NAMES,
-                            label="Select a material",
-                            show_label=False,
-                            container=False,
-                            filterable=True,
-                        )
-                        finder_btn = gr.Button("Get latest snapshot",
-                                               variant="primary", size="sm")
+                            choices=MATERIAL_NAMES, show_label=False,
+                            container=False, filterable=True)
+                        finder_btn = gr.Button(
+                            "Get snapshot", variant="primary", size="sm")
                         finder_out = gr.Markdown("", elem_id="finder-result")
 
-                # MAIN CHAT
+                # CENTER: Chat
                 with gr.Column(scale=3):
                     chatbot = gr.Chatbot(
-                        type="messages", height=520,
+                        type="messages", height=500,
                         avatar_images=(
                             None, str(LOGO_PATH) if LOGO_PATH.exists() else None),
-                        show_label=False, show_copy_button=True,
-                    )
+                        show_label=False, show_copy_button=True)
                     with gr.Row():
-                        msg = gr.Textbox(
-                            placeholder="Ask about materials, variances, trends...",
-                            show_label=False, container=False, scale=8, autofocus=True,
-                        )
-                        send = gr.Button("Ask", variant="primary",
-                                         scale=1, min_width=80)
-                    mic = gr.Audio(sources=["microphone"], type="filepath",
-                                   label="Or speak your question", show_label=True)
+                        msg  = gr.Textbox(
+                            placeholder="Ask about materials, costs, risks, trends...",
+                            show_label=False, container=False,
+                            scale=8, autofocus=True)
+                        send = gr.Button(
+                            "Ask", variant="primary", scale=1, min_width=80)
+                    mic = gr.Audio(
+                        sources=["microphone"], type="filepath",
+                        label="Or speak your question", show_label=True)
 
-                # RIGHT SIDEBAR - Quick Reports + Suggested Questions
-                with gr.Column(scale=1, min_width=260):
-                    with gr.Group(elem_classes=["sidebar-card"]):
-                        gr.HTML("<h3>Quick Reports</h3>")
-                        with gr.Row():
-                            btn_reorder = gr.Button("🔄 Reorder Alerts", size="sm")
-                            btn_losses  = gr.Button("📉 Top Losses", size="sm")
-                        with gr.Row():
-                            btn_spend   = gr.Button("💵 Monthly Spend", size="sm")
-                            btn_runout  = gr.Button("⏳ Run-out Risks", size="sm")
-                        with gr.Row():
-                            btn_abc      = gr.Button("🏷️ ABC Analysis", size="sm")
-                            btn_priority = gr.Button("📋 Buy Priority", size="sm")
-                        with gr.Row():
-                            btn_prodrisk = gr.Button("⚠️ Production Risk", size="sm")
-                        report_out = gr.Markdown("", elem_id="finder-result")
-
+                # RIGHT: Suggested Questions
+                with gr.Column(scale=1, min_width=240):
                     with gr.Group(elem_classes=["sidebar-card"]):
                         gr.HTML("<h3>Suggested Questions</h3>")
                         suggest_btns = [
                             gr.Button(q, elem_classes=["suggest-btn"])
-                            for q in SUGGESTED
-                        ]
+                            for q in SUGGESTED]
 
         # ================================================================
-        # TAB 2 — MATERIAL LOOKUP
+        # TAB 2 — INTELLIGENCE REPORTS (charts + summaries)
+        # ================================================================
+        with gr.Tab("📊 Intelligence Reports"):
+            gr.HTML('<div class="side-label" style="margin:10px 0 6px;">Select a report:</div>')
+            with gr.Row():
+                rb_abc      = gr.Button("🏷️ ABC Classification",    variant="secondary")
+                rb_priority = gr.Button("📋 Purchasing Priority",    variant="secondary")
+                rb_risk     = gr.Button("⚠️ Production Risk",        variant="secondary")
+                rb_reorder  = gr.Button("🔄 Reorder Alerts",         variant="secondary")
+            with gr.Row():
+                rb_losses   = gr.Button("📉 Top Losses",             variant="secondary")
+                rb_spend    = gr.Button("💵 Monthly Spend",          variant="secondary")
+                rb_runout   = gr.Button("⏳ Run-out Forecast",        variant="secondary")
+
+            with gr.Row():
+                rpt_chart   = gr.Plot(label="", show_label=False)
+                rpt_summary = gr.Markdown(
+                    "👆 Click a report above to load insights.",
+                    elem_id="finder-result")
+
+        # ================================================================
+        # TAB 3 — MATERIAL LOOKUP (with chart)
         # ================================================================
         with gr.Tab("🔍 Material Lookup"):
             with gr.Row():
-                with gr.Column(scale=1, min_width=280):
+                with gr.Column(scale=1, min_width=240):
                     with gr.Group(elem_classes=["sidebar-card"]):
                         gr.HTML("<h3>Select Material</h3>")
-                        lookup_dd = gr.Dropdown(
-                            choices=MATERIAL_NAMES,
-                            show_label=False,
-                            container=False,
-                            filterable=True,
-                        )
+                        lookup_dd  = gr.Dropdown(
+                            choices=MATERIAL_NAMES, show_label=False,
+                            container=False, filterable=True)
                         lookup_btn = gr.Button(
                             "Get full profile", variant="primary")
-
                 with gr.Column(scale=2):
                     with gr.Group(elem_classes=["sidebar-card"]):
                         gr.HTML("<h3>Snapshot &amp; Reference Data</h3>")
                         lookup_snap = gr.Markdown(
-                            "Select a material and click 'Get full profile'.",
+                            "Select a material to see its full profile.",
                             elem_id="finder-result")
-
                 with gr.Column(scale=2):
-                    with gr.Group(elem_classes=["sidebar-card"]):
-                        gr.HTML("<h3>Monthly Trend</h3>")
-                        lookup_trend = gr.Markdown("", elem_id="finder-result")
+                    lookup_chart = gr.Plot(label="Monthly Trend", show_label=False)
 
         # ================================================================
-        # TAB 3 — ADMIN
+        # TAB 4 — ADMIN
         # ================================================================
         with gr.Tab("⚙️ Admin"):
             gr.Markdown(
-                "### Lobels Stores — Admin Panel\n"
-                "Password-protected. Enter the admin password to access data tools.")
+                "### Admin Panel\nPassword-protected. "
+                "Enter the admin password to access data tools.")
             with gr.Row():
                 with gr.Column(scale=1):
                     admin_pwd = gr.Textbox(
-                        label="Admin Password", type="password", container=True)
+                        label="Admin Password", type="password")
                     with gr.Row():
-                        btn_sync_status = gr.Button(
-                            "📡 Sync Status", variant="primary")
-                        btn_quality = gr.Button(
-                            "📊 Data Quality", variant="secondary")
+                        btn_sync_status = gr.Button("📡 Sync Status",
+                                                    variant="primary")
+                        btn_quality     = gr.Button("📊 Data Quality",
+                                                    variant="secondary")
                 with gr.Column(scale=2):
                     admin_out = gr.Markdown(
                         "Enter password and select an action.",
                         elem_id="finder-result")
 
-    # footer
-    netrisyl_footer = (f'<img src="{NETRISYL_DATA_URI}" alt="Netrisyl Insights"/>'
-                       if NETRISYL_DATA_URI else "Netrisyl Insights")
     gr.HTML(f"""
     <div id="netrisyl-footer">
-        <p class="prototype-note">Lobels Stores Assistant &mdash; Prototype.
-        Answers only from loaded stores data.</p>
+        <p class="prototype-note">Lobels Stores Intelligence Platform &mdash; Prototype &middot;
+        Data: Jan–Jun 2026</p>
         <div class="powered-row">
             <span class="label">Powered by</span>
-            {netrisyl_footer}
+            {powered_html}
         </div>
     </div>
     """)
 
-    # ── Chat tab plumbing ──
+    # ── Chat plumbing ──────────────────────────────────────────
     def respond(message, history):
         if not message or not message.strip():
             return "", history or []
@@ -1214,26 +1505,31 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
         respond, [msg, chatbot], [msg, chatbot])
     finder_btn.click(material_snapshot, inputs=material_dd, outputs=finder_out)
     material_dd.change(material_snapshot, inputs=material_dd, outputs=finder_out)
-    btn_reorder.click(report_reorder, outputs=report_out)
-    btn_losses.click(report_losses, outputs=report_out)
-    btn_spend.click(report_spend, outputs=report_out)
-    btn_runout.click(report_runout, outputs=report_out)
-    btn_abc.click(report_abc, outputs=report_out)
-    btn_priority.click(report_purchasing_priority, outputs=report_out)
-    btn_prodrisk.click(report_production_risk, outputs=report_out)
     for btn, q in zip(suggest_btns, SUGGESTED):
         btn.click(lambda x=q: x, outputs=msg).then(
             respond, [msg, chatbot], [msg, chatbot])
 
-    # ── Material Lookup tab plumbing ──
-    lookup_btn.click(
-        material_full_lookup, inputs=lookup_dd,
-        outputs=[lookup_snap, lookup_trend])
-    lookup_dd.change(
-        material_full_lookup, inputs=lookup_dd,
-        outputs=[lookup_snap, lookup_trend])
+    # ── Reports plumbing ───────────────────────────────────────
+    rb_abc.click(chart_abc,               outputs=[rpt_chart, rpt_summary])
+    rb_priority.click(chart_purchasing_priority, outputs=[rpt_chart, rpt_summary])
+    rb_risk.click(chart_production_risk,  outputs=[rpt_chart, rpt_summary])
+    rb_reorder.click(chart_reorder,       outputs=[rpt_chart, rpt_summary])
+    rb_losses.click(chart_losses,         outputs=[rpt_chart, rpt_summary])
+    rb_spend.click(chart_monthly_spend,   outputs=[rpt_chart, rpt_summary])
+    rb_runout.click(chart_runout,         outputs=[rpt_chart, rpt_summary])
 
-    # ── Admin tab plumbing ──
+    # ── Material Lookup plumbing ───────────────────────────────
+    def full_lookup(name):
+        snap, trend_md = material_full_lookup(name)
+        fig = chart_material_trend(name)
+        return snap, fig
+
+    lookup_btn.click(full_lookup, inputs=lookup_dd,
+                     outputs=[lookup_snap, lookup_chart])
+    lookup_dd.change(full_lookup, inputs=lookup_dd,
+                     outputs=[lookup_snap, lookup_chart])
+
+    # ── Admin plumbing ─────────────────────────────────────────
     btn_sync_status.click(
         lambda pwd: admin_login(pwd, "sync_status"),
         inputs=admin_pwd, outputs=admin_out)
