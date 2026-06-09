@@ -985,83 +985,40 @@ theme = gr.themes.Soft(
 
 
 # ---------------------------------------------------------------------------
-# Admin functions
 # ---------------------------------------------------------------------------
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "netrisyl2026")
-
-
-def get_sync_status():
-    """Last sync date and row counts per month."""
-    try:
-        latest = sb.table("lobels_stores").select(
-            "txn_date").eq("client_id", CLIENT_ID
-            ).order("txn_date", desc=True).limit(1).execute().data
-        last_date = latest[0]["txn_date"] if latest else "Unknown"
-        counts = sb.table("lobels_stores").select(
-            "month", count="exact").eq("client_id", CLIENT_ID
-            ).execute()
-        month_rows = sb.table("lobels_stores").select(
-            "month").eq("client_id", CLIENT_ID).execute().data
-        agg = {}
-        for r in month_rows:
-            m = r["month"]
-            agg[m] = agg.get(m, 0) + 1
-        month_lines = "\n".join(
-            f"- **{m}:** {agg[m]:,} rows"
-            for m in MONTH_ORDER if m in agg)
-        mat_count = sb.table("lobels_materials").select(
-            "stock_code", count="exact").execute()
-        return (f"### ✅ Data Sync Status\n\n"
-                f"**Last transaction date:** {last_date}\n\n"
-                f"**Total daily rows:** {counts.count:,}\n\n"
-                f"**Materials in master:** {mat_count.count}\n\n"
-                f"**Rows by month:**\n{month_lines}")
-    except Exception as e:
-        return f"### ⚠️ Could not fetch sync status\n{str(e)}"
-
-
-def get_data_quality():
-    """Data quality checks."""
+# Data Coverage tab function
+# ---------------------------------------------------------------------------
+def get_data_coverage():
+    """Pull data coverage stats from Supabase for the Data Coverage tab."""
     try:
         rows = sb.table("lobels_stores").select(
-            "description, variance_flag, variance, month"
+            "month, txn_date, description"
         ).eq("client_id", CLIENT_ID).execute().data
-        total = len(rows)
-        losses = [r for r in rows if r.get("variance_flag") == "LOSS"]
-        gains  = [r for r in rows if r.get("variance_flag") == "GAIN"]
-        ok     = [r for r in rows if r.get("variance_flag") == "OK"]
-        mats_no_cost = sb.table("lobels_materials").select(
-            "description, unit_cost_usd").execute().data
-        no_cost = [m["description"] for m in mats_no_cost
-                   if not m.get("unit_cost_usd")]
-        lines = [
-            "### 📊 Data Quality Report\n",
-            f"**Total rows:** {total:,}",
-            f"**OK variance rows:** {len(ok):,}",
-            f"**LOSS rows:** {len(losses):,}",
-            f"**GAIN rows:** {len(gains):,}",
-        ]
-        if no_cost:
-            lines.append(f"\n**⚠️ Materials missing unit cost ({len(no_cost)}):**")
-            for n in no_cost[:10]:
-                lines.append(f"- {n}")
-            if len(no_cost) > 10:
-                lines.append(f"- …and {len(no_cost)-10} more")
-        else:
-            lines.append("\n**✅ All materials have unit cost data**")
-        return "\n\n".join(lines)
+
+        months_seen = {}
+        materials = set()
+        latest_date = ""
+        for r in rows:
+            m = r["month"]
+            months_seen[m] = months_seen.get(m, 0) + 1
+            materials.add(r["description"])
+            if r["txn_date"] > latest_date:
+                latest_date = r["txn_date"]
+
+        ordered = [(m, months_seen[m]) for m in MONTH_ORDER if m in months_seen]
+        mat_count = sb.table("lobels_materials").select(
+            "stock_code", count="exact").execute()
+
+        return {
+            "total_rows": len(rows),
+            "months": ordered,
+            "active_materials": len(materials),
+            "master_materials": mat_count.count,
+            "latest_date": latest_date,
+            "months_covered": len(ordered),
+        }
     except Exception as e:
-        return f"### ⚠️ Could not run quality check\n{str(e)}"
-
-
-def admin_login(password, action):
-    if password != ADMIN_PASSWORD:
-        return "### ❌ Incorrect password. Access denied."
-    if action == "sync_status":
-        return get_sync_status()
-    elif action == "data_quality":
-        return get_data_quality()
-    return "### Select an action above."
+        return {"error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -1515,25 +1472,33 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
                     lookup_chart = gr.Plot(label="Monthly Trend", show_label=False)
 
         # ================================================================
-        # TAB 4 — ADMIN
         # ================================================================
-        with gr.Tab("⚙️ Admin"):
-            gr.Markdown(
-                "### Admin Panel\nPassword-protected. "
-                "Enter the admin password to access data tools.")
+        # TAB 4 — DATA COVERAGE
+        # ================================================================
+        with gr.Tab("📋 Data Coverage"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    admin_pwd = gr.Textbox(
-                        label="Admin Password", type="password")
-                    with gr.Row():
-                        btn_sync_status = gr.Button("📡 Sync Status",
-                                                    variant="primary")
-                        btn_quality     = gr.Button("📊 Data Quality",
-                                                    variant="secondary")
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>Data Summary</h3>")
+                        coverage_info = gr.Markdown(
+                            "Loading data coverage...",
+                            elem_id="finder-result")
+                    with gr.Group(elem_classes=["sidebar-card"]):
+                        gr.HTML("<h3>About this Platform</h3>")
+                        gr.Markdown(
+                            "**Lobels Stores Intelligence Platform**\n\n"
+                            "Built by **Netrisyl Insights** — an AI-powered "
+                            "inventory intelligence layer on your existing "
+                            "Google Sheets workflow.\n\n"
+                            "**How it works:**\n"
+                            "- Your team updates the stores register as normal\n"
+                            "- Data syncs automatically to the AI engine\n"
+                            "- Insights update within seconds of any edit\n\n"
+                            "📧 sylvester@netrisyl.com\n\n"
+                            "🌐 netrisyl.com")
                 with gr.Column(scale=2):
-                    admin_out = gr.Markdown(
-                        "Enter password and select an action.",
-                        elem_id="finder-result")
+                    coverage_chart = gr.Plot(
+                        label="Rows by Month", show_label=False)
 
     gr.HTML(f"""
     <div id="netrisyl-footer">
@@ -1586,13 +1551,35 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
     lookup_dd.change(full_lookup, inputs=lookup_dd,
                      outputs=[lookup_snap, lookup_chart])
 
-    # ── Admin plumbing ─────────────────────────────────────────
-    btn_sync_status.click(
-        lambda pwd: admin_login(pwd, "sync_status"),
-        inputs=admin_pwd, outputs=admin_out)
-    btn_quality.click(
-        lambda pwd: admin_login(pwd, "data_quality"),
-        inputs=admin_pwd, outputs=admin_out)
+    # ── Data Coverage plumbing — load on startup ───────────────
+    def load_coverage():
+        data = get_data_coverage()
+        if "error" in data:
+            return f"⚠️ {data['error']}", _empty_fig("Could not load coverage data.")
+        months = [m for m, _ in data["months"]]
+        counts = [c for _, c in data["months"]]
+        fig = go.Figure(go.Bar(
+            x=months, y=counts,
+            marker_color=C_NAVY,
+            text=[f"{c:,}" for c in counts],
+            textposition="outside", textfont=dict(size=11)))
+        fig.update_layout(
+            title="Daily Transaction Rows by Month",
+            yaxis_title="Rows",
+            **_layout(height=380))
+        info = (
+            f"### ✅ Data Coverage\n\n"
+            f"**Period:** {months[0]} – {months[-1]} 2026\n\n"
+            f"**Months loaded:** {data['months_covered']}\n\n"
+            f"**Total rows:** {data['total_rows']:,}\n\n"
+            f"**Active materials:** {data['active_materials']}\n\n"
+            f"**Materials master:** {data['master_materials']} entries\n\n"
+            f"**Latest record:** {data['latest_date']}\n\n"
+            f"---\n*Data syncs automatically when the stores register is updated.*"
+        )
+        return info, fig
+
+    demo.load(load_coverage, outputs=[coverage_info, coverage_chart])
 
 
 if __name__ == "__main__":
