@@ -1107,15 +1107,19 @@ PLOTLY_LAYOUT = dict(
     font=dict(family="Inter, Arial", size=12),
     plot_bgcolor="white",
     paper_bgcolor="white",
-    margin=dict(l=10, r=20, t=50, b=40),
 )
+
+def _layout(height=420, margin=None, **extra):
+    """Build a layout dict merging base settings with per-chart overrides."""
+    m = margin or dict(l=10, r=20, t=50, b=40)
+    return dict(**PLOTLY_LAYOUT, height=height, margin=m, **extra)
 
 def _empty_fig(msg="No data available"):
     fig = go.Figure()
     fig.add_annotation(text=msg, xref="paper", yref="paper",
                        x=0.5, y=0.5, showarrow=False,
                        font=dict(size=15, color="#999"))
-    fig.update_layout(**PLOTLY_LAYOUT)
+    fig.update_layout(**_layout())
     return fig
 
 
@@ -1146,8 +1150,8 @@ def chart_abc():
         text=[f"${_fmt(v)} · {c}" for v,c in zip(values,cls)],
         textposition="auto", textfont=dict(color="white", size=10)))
     fig.update_layout(title="ABC Classification — Value by Material (USD)",
-                      xaxis_title="Total Value (USD)", **PLOTLY_LAYOUT,
-                      height=520, margin=dict(l=220, r=20, t=50, b=40))
+                      xaxis_title="Total Value (USD)",
+                      **_layout(height=520, margin=dict(l=220, r=20, t=50, b=40)))
     a,b,c_ = res["A"], res["B"], res["C"]
     summary = (
         f"### 🏷️ ABC Classification\n**Total: ${_fmt(res['total_value_usd'])}**\n\n"
@@ -1178,8 +1182,7 @@ def chart_purchasing_priority():
         textposition="auto", textfont=dict(size=10)))
     fig.update_layout(title="Purchasing Priority — Urgency Score (10=Critical)",
                       xaxis=dict(title="Urgency Score", range=[0,10]),
-                      **PLOTLY_LAYOUT, height=520,
-                      margin=dict(l=220, r=20, t=50, b=40))
+                      **_layout(height=520, margin=dict(l=220, r=20, t=50, b=40)))
     critical = [i for i in items if i["urgency_score"] >= 9]
     urgent   = [i for i in items if 6 <= i["urgency_score"] < 9]
     summary = (
@@ -1213,8 +1216,8 @@ def chart_production_risk():
         text=[f"${_fmt(v)}/day" for v in vals],
         textposition="auto", textfont=dict(size=10)))
     fig.update_layout(title="Critical Production Risk — Combined Risk Score",
-                      xaxis_title="Risk Score", **PLOTLY_LAYOUT, height=480,
-                      margin=dict(l=220, r=20, t=50, b=40))
+                      xaxis_title="Risk Score",
+                      **_layout(height=480, margin=dict(l=220, r=20, t=50, b=40)))
     summary = (
         f"### ⚠️ Production Risk\n{res['message']}\n\n"
         "**Highest risk:**\n" +
@@ -1243,8 +1246,8 @@ def chart_losses():
         text=[f"${_fmt(u)} ({_fmt(k)} kg)" for u,k in zip(usd,kgs)],
         textposition="auto", textfont=dict(color="white", size=10)))
     fig.update_layout(title=f"Top Losses by Value — {month} 2026 (USD)",
-                      xaxis_title="Loss Value (USD)", **PLOTLY_LAYOUT, height=460,
-                      margin=dict(l=220, r=20, t=50, b=40))
+                      xaxis_title="Loss Value (USD)",
+                      **_layout(height=460, margin=dict(l=220, r=20, t=50, b=40)))
     total_usd = sum(abs(i["variance_kg"]) * mats_cost.get(i["material"], 0)
                     for i in items)
     summary = (
@@ -1276,7 +1279,7 @@ def chart_monthly_spend():
         text=[f"${_fmt(v)}" for v in values],
         textposition="outside", textfont=dict(size=10)))
     fig.update_layout(title="Monthly Materials Cost (USD) — 2026",
-                      yaxis_title="Value (USD)", height=420, **PLOTLY_LAYOUT)
+                      yaxis_title="Value (USD)", **_layout(height=420))
     total = sum(values)
     summary = (
         f"### 💵 Monthly Spend\n**Total: ${_fmt(total)}**\n\n"
@@ -1301,9 +1304,8 @@ def chart_reorder():
                          orientation="h", marker_color=C_NAVY, opacity=0.35))
     fig.update_layout(title="Reorder Alerts — Current Stock vs Reorder Point",
                       barmode="overlay", xaxis_title="Quantity (kg)",
-                      **PLOTLY_LAYOUT, height=480,
-                      margin=dict(l=220, r=20, t=50, b=40),
-                      legend=dict(orientation="h", y=1.12))
+                      legend=dict(orientation="h", y=1.12),
+                      **_layout(height=480, margin=dict(l=220, r=20, t=50, b=40)))
     summary = (
         f"### 🔄 Reorder Alerts\n"
         f"**{res['needing_reorder']} of {res['checked']} materials** need reordering.\n\n" +
@@ -1350,9 +1352,9 @@ def chart_runout():
                     line=dict(width=3, color=C_NAVY)),
         name="Lead Time (days)"))
     fig.update_layout(title="Run-out Forecast — Days of Stock vs Lead Time",
-                      xaxis_title="Days", **PLOTLY_LAYOUT, height=480,
-                      margin=dict(l=220, r=20, t=50, b=40),
-                      legend=dict(orientation="h", y=1.12))
+                      xaxis_title="Days",
+                      legend=dict(orientation="h", y=1.12),
+                      **_layout(height=480, margin=dict(l=220, r=20, t=50, b=40)))
     critical = [r for r in risks if r["days_left"] <= r["lead_time"]]
     summary = (
         f"### ⏳ Run-out Forecast\n"
@@ -1381,7 +1383,7 @@ def chart_material_trend(material_name):
     fig.update_layout(
         title=f"Monthly Issued (kg) — {trend['material']}",
         yaxis_title="Issued (kg)",
-        **PLOTLY_LAYOUT)
+        **_layout())
     return fig
 
 
