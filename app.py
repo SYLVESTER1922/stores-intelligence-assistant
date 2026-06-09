@@ -400,24 +400,20 @@ def _latest_closing(description):
     return _num(rows[0]["physical_closing"])
 
 
-def _query_all(columns):
-    """Paginate through lobels_stores to get every row, bypassing server row caps."""
+def _query_all_months(columns):
+    """Query lobels_stores month by month — each month < 700 rows,
+    safely under Supabase's 1000 row server cap. Returns all rows."""
     all_rows = []
-    start = 0
-    page = 1000
-    while True:
+    for month_name in MONTH_ORDER:
         batch = sb.table("lobels_stores").select(columns).eq(
-            "client_id", CLIENT_ID).range(start, start + page - 1).execute().data
+            "client_id", CLIENT_ID).eq("month", month_name).execute().data
         all_rows.extend(batch)
-        if len(batch) < page:
-            break
-        start += page
     return all_rows
 
 
 def _batch_store_data():
-    """Fetch ALL store rows using pagination, return closing + avg-daily maps."""
-    rows = _query_all("description, physical_closing, daily_issues, txn_date")
+    """Fetch ALL store rows month by month, return closing + avg-daily maps."""
+    rows = _query_all_months("description, physical_closing, daily_issues, txn_date")
     closing_map = {}
     daily_sum   = {}
     daily_cnt   = {}
@@ -991,9 +987,7 @@ theme = gr.themes.Soft(
 def get_data_coverage():
     """Pull data coverage stats from Supabase for the Data Coverage tab."""
     try:
-        rows = sb.table("lobels_stores").select(
-            "month, txn_date, description"
-        ).eq("client_id", CLIENT_ID).execute().data
+        rows = _query_all_months("month, txn_date, description")
 
         months_seen = {}
         materials = set()
@@ -1230,8 +1224,8 @@ def chart_monthly_spend():
     mats = sb.table("lobels_materials").select(
         "description, unit_cost_usd").execute().data
     cost_map = {m["description"]: _num(m.get("unit_cost_usd")) for m in mats}
-    # Paginate to get ALL rows (bypasses Supabase's server-side row cap)
-    rows = _query_all("month, description, daily_issues")
+    # Query month by month — each month < 700 rows, under Supabase's 1000 row cap
+    rows = _query_all_months("month, description, daily_issues")
     # Compute value = daily_issues × unit_cost per month
     agg = {}
     for r in rows:
