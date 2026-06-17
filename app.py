@@ -1,5 +1,5 @@
 """
-LOBELS BISCUITS - STORES AI ASSISTANT
+STORES INTELLIGENCE PLATFORM - AI ASSISTANT
 ======================================
 Netrisyl Insights.
 Design replicated from JCC Assistant (navy + gold, Inter font).
@@ -763,7 +763,7 @@ FUNC_MAP = {
 }
 
 TODAY = date.today().strftime("%d %B %Y")
-SYSTEM_PROMPT = f"""You are the Lobels Biscuits Stores AI Assistant, built by Netrisyl Insights.
+SYSTEM_PROMPT = f"""You are the Stores Intelligence Assistant, built by Netrisyl Insights.
 Today's date is {TODAY}.
 You answer questions about raw material stores data: consumption, variances, trends,
 reorder status, costs/spend (in USD), suppliers, run-out forecasts, ABC classification,
@@ -1355,9 +1355,9 @@ def chart_material_trend(material_name):
 # ---------------------------------------------------------------------------
 # UI — Four tabs: Chat · Reports · Material Lookup · Admin
 # ---------------------------------------------------------------------------
-with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) as demo:
+with gr.Blocks(title="Stores Intelligence Platform", theme=theme, css=CUSTOM_CSS) as demo:
 
-    logo_img_html = (f'<img class="logo" src="{LOGO_DATA_URI}" alt="Lobels"/>'
+    logo_img_html = (f'<img class="logo" src="{LOGO_DATA_URI}" alt="Client"/>'
                      if LOGO_DATA_URI else "")
     powered_html  = (f'<img src="{NETRISYL_DATA_URI}" alt="Netrisyl"/>'
                      if NETRISYL_DATA_URI else '<div class="ni">Netrisyl Insights</div>')
@@ -1366,7 +1366,7 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
         <div class="hero-left">
             {logo_img_html}
             <div class="titles">
-                <div class="brand-name">Lobels Biscuits &amp; Sweets</div>
+                <div class="brand-name">Stores Intelligence Platform</div>
                 <h1>Stores Intelligence Platform</h1>
                 <p class="tagline">Production cost intelligence &middot; Inventory risk &middot; Procurement analytics</p>
             </div>
@@ -1480,7 +1480,7 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
                     with gr.Group(elem_classes=["sidebar-card"]):
                         gr.HTML("<h3>About this Platform</h3>")
                         gr.Markdown(
-                            "**Lobels Stores Intelligence Platform**\n\n"
+                            "**Stores Intelligence Platform**\n\n"
                             "Built by **Netrisyl Insights** — an AI-powered "
                             "inventory intelligence layer on your existing "
                             "Google Sheets workflow.\n\n"
@@ -1496,7 +1496,7 @@ with gr.Blocks(title="Lobels Stores AI Assistant", theme=theme, css=CUSTOM_CSS) 
 
     gr.HTML(f"""
     <div id="netrisyl-footer">
-        <p class="prototype-note">Lobels Stores Intelligence Platform &mdash; Prototype &middot;
+        <p class="prototype-note">Stores Intelligence Platform &mdash; Prototype &middot;
         Data: Jan–Jun 2026</p>
         <div class="powered-row">
             <span class="label">Powered by</span>
