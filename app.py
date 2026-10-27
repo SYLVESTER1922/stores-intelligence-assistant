@@ -64,12 +64,25 @@ def _fmt(n):
     return f"{n:,.2f}".rstrip("0").rstrip(".") if n else "0"
 
 
+def _fetch_all(qry, page=1000):
+    """Fetch every row of a query. A single API response is capped by the
+    project's max-rows setting (1000 by default), so page through it."""
+    qry = qry.order("id")
+    rows, start = [], 0
+    while True:
+        chunk = qry.range(start, start + page - 1).execute().data
+        if not chunk:
+            return rows
+        rows.extend(chunk)
+        start += len(chunk)
+
+
 # ---------------------------------------------------------------------------
 # Material list for the finder dropdown
 # ---------------------------------------------------------------------------
 def load_material_names():
-    rows = sb.table("lobels_stores").select("description").eq(
-        "client_id", CLIENT_ID).execute().data
+    rows = _fetch_all(sb.table("lobels_stores").select("description").eq(
+        "client_id", CLIENT_ID))
     names = sorted({r["description"] for r in rows if r.get("description")})
     return names
 
@@ -86,8 +99,8 @@ except Exception as e:
 def material_snapshot(material_name):
     if not material_name:
         return "Select a material above to see its latest snapshot."
-    rows = sb.table("lobels_stores").select("*").eq(
-        "client_id", CLIENT_ID).eq("description", material_name).execute().data
+    rows = _fetch_all(sb.table("lobels_stores").select("*").eq(
+        "client_id", CLIENT_ID).eq("description", material_name))
     if not rows:
         return f"No data found for **{material_name}**."
 
@@ -172,9 +185,9 @@ def report_spend():
     mats = sb.table("lobels_materials").select(
         "description, unit_cost_usd").execute().data
     cost_map = {m["description"]: _num(m.get("unit_cost_usd")) for m in mats}
-    rows = sb.table("lobels_stores").select(
+    rows = _fetch_all(sb.table("lobels_stores").select(
         "description, daily_issues").eq("client_id", CLIENT_ID
-        ).eq("month", month).execute().data
+        ).eq("month", month))
     spend = {}
     for r in rows:
         d = r["description"]
@@ -315,7 +328,7 @@ def q_material_total(description=None, month=None):
         qry = qry.ilike("description", f"%{description}%")
     if month:
         qry = qry.eq("month", month.upper())
-    rows = qry.execute().data
+    rows = _fetch_all(qry)
     if not rows:
         return {"found": False, "searched_for": description}
     total = sum(_num(r["daily_issues"]) for r in rows)
@@ -329,7 +342,7 @@ def q_top_materials(month=None, limit=10):
         "description, daily_issues, month").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
-    rows = qry.limit(10000).execute().data
+    rows = _fetch_all(qry)
     agg = {}
     for r in rows:
         agg[r["description"]] = agg.get(r["description"], 0) + _num(r["daily_issues"])
@@ -340,13 +353,18 @@ def q_top_materials(month=None, limit=10):
 
 def q_variances(month=None, flag="LOSS", limit=10):
     qry = sb.table("lobels_stores").select(
-        "description, variance, month").eq("client_id", CLIENT_ID)
+        "description, variance, month, txn_date").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
-    rows = qry.execute().data
+    rows = _fetch_all(qry)
+    # Variance is a running month-to-date figure, so each material/month
+    # should use its latest day's value, not an arbitrary row.
     seen = {}
     for r in rows:
-        seen[(r["description"], r["month"])] = _num(r["variance"])
+        key = (r["description"], r["month"])
+        if key not in seen or str(r.get("txn_date", "")) > str(seen[key][0]):
+            seen[key] = (r.get("txn_date", ""), _num(r["variance"]))
+    seen = {k: v[1] for k, v in seen.items()}
     agg = {}
     for (mat, mth), var in seen.items():
         agg[mat] = agg.get(mat, 0) + var
@@ -363,7 +381,7 @@ def q_category_breakdown(month=None):
         "category, daily_issues, month").eq("client_id", CLIENT_ID)
     if month:
         qry = qry.eq("month", month.upper())
-    rows = qry.execute().data
+    rows = _fetch_all(qry)
     agg = {}
     for r in rows:
         cat = r["category"] or "Other"
@@ -374,9 +392,9 @@ def q_category_breakdown(month=None):
 
 
 def q_monthly_trend(description):
-    rows = sb.table("lobels_stores").select(
+    rows = _fetch_all(sb.table("lobels_stores").select(
         "description, daily_issues, month").eq("client_id", CLIENT_ID
-        ).ilike("description", f"%{description}%").execute().data
+        ).ilike("description", f"%{description}%"))
     if not rows:
         return {"found": False, "searched_for": description}
     agg = {}
@@ -391,9 +409,9 @@ def q_monthly_trend(description):
 
 def _latest_closing(description):
     """Most recent physical closing stock for one material."""
-    rows = sb.table("lobels_stores").select(
+    rows = _fetch_all(sb.table("lobels_stores").select(
         "physical_closing, txn_date").eq("client_id", CLIENT_ID
-        ).ilike("description", f"%{description}%").execute().data
+        ).ilike("description", f"%{description}%"))
     if not rows:
         return None
     rows.sort(key=lambda r: str(r.get("txn_date", "")), reverse=True)
@@ -405,8 +423,8 @@ def _query_all_months(columns):
     safely under Supabase's 1000 row server cap. Returns all rows."""
     all_rows = []
     for month_name in MONTH_ORDER:
-        batch = sb.table("lobels_stores").select(columns).eq(
-            "client_id", CLIENT_ID).eq("month", month_name).execute().data
+        batch = _fetch_all(sb.table("lobels_stores").select(columns).eq(
+            "client_id", CLIENT_ID).eq("month", month_name))
         all_rows.extend(batch)
     return all_rows
 
@@ -506,31 +524,6 @@ def q_production_risk():
             "top_risks": risk_items[:10],
             "message": (f"{len(critical)} materials pose critical production risk"
                         if critical else "No critical production risks detected.")}
-    """Materials at or below reorder point. If description given, just that one."""
-    mats = sb.table("lobels_materials").select("*").execute().data
-    if description:
-        mats = [m for m in mats if description.lower() in (m.get("description") or "").lower()]
-    out = []
-    for m in mats:
-        rop = _num(m.get("reorder_point"))
-        if rop <= 0:
-            continue
-        closing = _latest_closing(m["description"])
-        if closing is None:
-            continue
-        out.append({
-            "material": m["description"],
-            "current_stock_kg": round(closing, 1),
-            "reorder_point_kg": round(rop, 1),
-            "status": "REORDER NOW" if closing <= rop else "OK",
-            "supplier": m.get("supplier"),
-            "lead_time_days": m.get("lead_time_days"),
-        })
-    # Sort so REORDER NOW items come first
-    out.sort(key=lambda x: (x["status"] != "REORDER NOW", x["material"]))
-    needing = [o for o in out if o["status"] == "REORDER NOW"]
-    return {"checked": len(out), "needing_reorder": len(needing),
-            "items": out if description else (needing or out[:10])}
 
 
 def q_material_cost(description, month=None):
@@ -591,9 +584,9 @@ def q_runout_forecast(description, closing_map=None, avg_daily_map=None):
     if avg_daily_map is not None:
         avg_daily = avg_daily_map.get(name, 0)
     else:
-        rows = sb.table("lobels_stores").select(
+        rows = _fetch_all(sb.table("lobels_stores").select(
             "daily_issues").eq("client_id", CLIENT_ID
-            ).ilike("description", f"%{name}%").execute().data
+            ).ilike("description", f"%{name}%"))
         issues = [_num(r["daily_issues"]) for r in rows if _num(r["daily_issues"]) > 0]
         avg_daily = sum(issues) / len(issues) if issues else 0
     if avg_daily <= 0:
@@ -617,8 +610,8 @@ def q_abc_classification():
     mats = sb.table("lobels_materials").select(
         "description, unit_cost_usd").execute().data
     cost_map = {m["description"]: _num(m.get("unit_cost_usd")) for m in mats}
-    rows = sb.table("lobels_stores").select(
-        "description, daily_issues").eq("client_id", CLIENT_ID).execute().data
+    rows = _fetch_all(sb.table("lobels_stores").select(
+        "description, daily_issues").eq("client_id", CLIENT_ID))
     # total issued value per material
     spend = {}
     for r in rows:
